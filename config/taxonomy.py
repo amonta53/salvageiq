@@ -29,6 +29,7 @@
 # =========================================================
 
 PART_TAXONOMY = {
+    # ---- Lighting ----
     "Headlight Assembly": {
         "include": ["headlight", "head lamp", "headlamp", "lh headlight", "rh headlight"],
         "exclude": ["bulb", "bulbs"],
@@ -37,41 +38,15 @@ PART_TAXONOMY = {
         "include": ["tail light", "taillight", "rear lamp"],
         "exclude": ["bulb", "bulbs"],
     },
+    "Fog Light Assembly": {
+        "include": ["fog light", "fog lamp", "driving light"],
+        "exclude": ["bulb", "bulbs", "switch"],
+    },
+
+    # ---- Exterior body ----
     "Side Mirror": {
         "include": ["mirror", "side mirror", "door mirror", "side view mirror"],
         "exclude": ["glass", "mirror glass"],
-    },
-    "Radio / Infotainment": {
-        "include": ["radio", "stereo", "infotainment", "display screen", "console"],
-        "exclude": ["wiring", "wire", "harness"],
-    },
-    "Instrument Cluster": {
-        "include": ["cluster", "speedometer", "gauge cluster"],
-        "exclude": ["individual gauge", "gauge only"],
-    },
-    "Alternator": {
-        "include": ["alternator"],
-        "exclude": ["rebuild kit", "rebuild kits"],
-    },
-    "Starter": {
-        "include": ["starter", "starter motor"],
-        "exclude": ["solenoid", "solenoids"],
-    },
-    "Engine Control Module": {
-        "include": ["ecm", "ecu", "pcm", "engine computer"],
-        "exclude": [],
-    },
-    "Transmission Control Module": {
-        "include": ["tcm", "transmission computer"],
-        "exclude": [],
-    },
-    "Wheel / Rim": {
-        "include": ["wheel", "rim"],
-        "exclude": ["tire", "tires"],
-    },
-    "Seat": {
-        "include": ["driver seat", "passenger seat", "rear seat", "seat"],
-        "exclude": ["seat cover", "seat covers"],
     },
     "Door Assembly": {
         "include": ["complete door", "door assembly", "door"],
@@ -97,17 +72,102 @@ PART_TAXONOMY = {
         "include": ["grille", "front grille"],
         "exclude": ["emblem", "emblems"],
     },
-    "Window Regulator": {
-        "include": ["window regulator", "power window motor", "window motor"],
-        "exclude": ["switch", "switches"],
+    "Liftgate": {
+        "include": ["liftgate", "rear hatch", "hatch", "rear gate"],
+        "exclude": ["handle", "latch", "hinge", "liftgate glass", "spoiler",
+                    "liftgate motor", "liftgate actuator"],
+    },
+    "Tailgate": {
+        "include": ["tailgate"],
+        "exclude": ["handle", "latch", "hinge", "tailgate cable"],
+    },
+
+    # ---- Interior ----
+    "Radio / Infotainment": {
+        "include": ["radio", "stereo", "infotainment", "display screen"],
+        "exclude": ["wiring", "wire", "harness"],
+    },
+    "Instrument Cluster": {
+        "include": ["cluster", "speedometer", "gauge cluster"],
+        "exclude": ["individual gauge", "gauge only"],
+    },
+    "Seat": {
+        "include": ["driver seat", "passenger seat", "rear seat", "seat"],
+        "exclude": ["seat cover", "seat covers"],
+    },
+    "Steering Wheel": {
+        "include": ["steering wheel"],
+        "exclude": ["button", "buttons"],
+    },
+
+    # ---- Electronics / modules ----
+    "Engine Control Module": {
+        "include": ["ecm", "ecu", "pcm", "engine computer"],
+        "exclude": [],
+    },
+    "Transmission Control Module": {
+        "include": ["tcm", "transmission computer"],
+        "exclude": [],
+    },
+    "ABS Module": {
+        "include": ["abs module", "abs control module", "abs pump",
+                    "anti-lock brake module", "abs unit"],
+        "exclude": ["abs sensor", "abs ring", "wheel speed sensor"],
+    },
+    "Body Control Module": {
+        "include": ["bcm", "body control module", "body module"],
+        "exclude": [],
+    },
+    "Ignition Coil": {
+        "include": ["ignition coil", "coil pack", "coil on plug"],
+        "exclude": ["spark plug", "ignition wire", "distributor"],
+    },
+
+    # ---- Mechanical / drivetrain ----
+    "Alternator": {
+        "include": ["alternator"],
+        "exclude": ["rebuild kit", "rebuild kits"],
+    },
+    "Starter": {
+        "include": ["starter", "starter motor"],
+        "exclude": ["solenoid", "solenoids"],
     },
     "AC Compressor": {
         "include": ["ac compressor", "air conditioning compressor"],
         "exclude": ["line", "lines", "hose", "hoses"],
     },
-    "Steering Wheel": {
-        "include": ["steering wheel"],
-        "exclude": ["button", "buttons"],
+    "Power Steering Pump": {
+        "include": ["power steering pump", "ps pump"],
+        "exclude": ["rack", "hose", "line", "fluid", "reservoir"],
+    },
+    "Catalytic Converter": {
+        "include": ["catalytic converter", "cat converter", "catalytic"],
+        "exclude": ["oxygen sensor", "o2 sensor", "flex pipe", "header"],
+    },
+    "Radiator": {
+        "include": ["radiator"],
+        "exclude": ["hose", "cap", "flush", "overflow", "coolant tank", "reservoir"],
+    },
+    "Blower Motor": {
+        "include": ["blower motor", "hvac blower", "heater blower"],
+        "exclude": ["resistor", "blower wheel", "cage"],
+    },
+    "Strut / Shock": {
+        "include": ["strut", "strut assembly", "shock absorber",
+                    "front strut", "rear strut"],
+        "exclude": ["strut mount", "spring", "bearing", "boot", "spring perch"],
+    },
+
+    # ---- Wheels ----
+    "Wheel / Rim": {
+        "include": ["wheel", "rim"],
+        "exclude": ["tire", "tires"],
+    },
+
+    # ---- Glass / window ----
+    "Window Regulator": {
+        "include": ["window regulator", "power window motor", "window motor"],
+        "exclude": ["switch", "switches"],
     },
 }
 
@@ -117,26 +177,43 @@ PART_TAXONOMY = {
 # Higher-priority categories win.
 # =========================================================
 CATEGORY_PRIORITY = [
+    # Modules first — most specific, least ambiguous
     "Engine Control Module",
     "Transmission Control Module",
-    "Alternator",
-    "Starter",
+    "ABS Module",
+    "Body Control Module",
+    "Ignition Coil",
     "Instrument Cluster",
     "Radio / Infotainment",
+    # Mechanical
+    "Alternator",
+    "Starter",
+    "AC Compressor",
+    "Power Steering Pump",
+    "Catalytic Converter",
+    "Radiator",
+    "Blower Motor",
+    "Strut / Shock",
+    # Lighting
     "Headlight Assembly",
     "Tail Light Assembly",
+    "Fog Light Assembly",
+    # Exterior body
     "Side Mirror",
-    "Wheel / Rim",
-    "Seat",
-    "Door Assembly",
     "Fender",
     "Hood",
     "Front Bumper Assembly",
     "Rear Bumper Assembly",
     "Grille",
-    "Window Regulator",
-    "AC Compressor",
+    "Liftgate",
+    "Tailgate",
+    "Door Assembly",
+    # Interior
+    "Seat",
     "Steering Wheel",
+    # Other
+    "Wheel / Rim",
+    "Window Regulator",
 ]
 
 # =========================================================
@@ -145,6 +222,8 @@ CATEGORY_PRIORITY = [
 # =========================================================
 ECM_TERMS = {"ecm", "ecu", "pcm", "engine computer"}
 TCM_TERMS = {"tcm", "transmission computer"}
+ABS_TERMS = {"abs module", "abs control module", "abs pump", "anti-lock brake module"}
+BCM_TERMS = {"bcm", "body control module", "body module"}
 
 # =========================================================
 # Search part terms
@@ -152,26 +231,43 @@ TCM_TERMS = {"tcm", "transmission computer"}
 # These are intentionally simpler than taxonomy categories.
 # =========================================================
 SEARCH_PART_TERMS = [
+    # Lighting
     "headlight",
     "tail light",
+    "fog light",
+    # Exterior body
     "mirror",
-    "radio",
-    "instrument cluster",
-    "alternator",
-    "starter",
-    "ecm",
-    "tcm",
-    "wheel",
-    "seat",
     "door",
     "fender",
     "hood",
     "front bumper",
     "rear bumper",
     "grille",
-    "window regulator",
-    "ac compressor",
+    "liftgate",
+    "tailgate",
+    # Interior
+    "radio",
+    "instrument cluster",
+    "seat",
     "steering wheel",
+    # Electronics / modules
+    "ecm",
+    "tcm",
+    "abs module",
+    "body control module",
+    "ignition coil",
+    # Mechanical
+    "alternator",
+    "starter",
+    "ac compressor",
+    "power steering pump",
+    "catalytic converter",
+    "radiator",
+    "blower motor",
+    "strut",
+    # Wheels / glass
+    "wheel",
+    "window regulator",
 ]
 
 # =========================================================
@@ -179,35 +275,75 @@ SEARCH_PART_TERMS = [
 # Raw term -> normalized comparison term
 # =========================================================
 PART_ALIASES = {
+    # Headlight
     "headlight": "headlight",
     "head lamp": "headlight",
     "headlamp": "headlight",
     "lh headlight": "headlight",
     "rh headlight": "headlight",
 
+    # Tail light
     "tail light": "tail light",
     "taillight": "tail light",
     "rear lamp": "tail light",
 
+    # Fog light
+    "fog light": "fog light",
+    "fog lamp": "fog light",
+    "driving light": "fog light",
+
+    # Mirror
     "mirror": "mirror",
     "side mirror": "mirror",
     "door mirror": "mirror",
     "side view mirror": "mirror",
 
+    # Door
+    "complete door": "door",
+    "door assembly": "door",
+    "door": "door",
+
+    # Body panels
+    "fender": "fender",
+    "hood": "hood",
+
+    # Bumpers
+    "front bumper": "front bumper",
+    "bumper cover": "front bumper",
+    "rear bumper": "rear bumper",
+
+    # Grille
+    "grille": "grille",
+    "front grille": "grille",
+
+    # Liftgate / tailgate
+    "liftgate": "liftgate",
+    "rear hatch": "liftgate",
+    "hatch": "liftgate",
+    "rear gate": "liftgate",
+    "tailgate": "tailgate",
+
+    # Interior electronics
     "radio": "radio",
     "stereo": "radio",
     "infotainment": "radio",
     "display screen": "radio",
-    "console": "radio",
 
+    "instrument cluster": "instrument cluster",
     "cluster": "instrument cluster",
     "speedometer": "instrument cluster",
     "gauge cluster": "instrument cluster",
 
-    "alternator": "alternator",
-    "starter": "starter",
-    "starter motor": "starter",
+    # Seats
+    "driver seat": "seat",
+    "passenger seat": "seat",
+    "rear seat": "seat",
+    "seat": "seat",
 
+    # Steering
+    "steering wheel": "steering wheel",
+
+    # Control modules
     "ecm": "ecu",
     "pcm": "ecu",
     "ecu": "ecu",
@@ -216,62 +352,98 @@ PART_ALIASES = {
     "tcm": "tcm",
     "transmission computer": "tcm",
 
-    "wheel": "wheel",
-    "rim": "wheel",
+    "abs module": "abs module",
+    "abs control module": "abs module",
+    "abs pump": "abs module",
+    "anti-lock brake module": "abs module",
+    "abs unit": "abs module",
 
-    "driver seat": "seat",
-    "passenger seat": "seat",
-    "rear seat": "seat",
-    "seat": "seat",
+    "bcm": "bcm",
+    "body control module": "bcm",
+    "body module": "bcm",
 
-    "complete door": "door",
-    "door assembly": "door",
-    "door": "door",
+    "ignition coil": "ignition coil",
+    "coil pack": "ignition coil",
+    "coil on plug": "ignition coil",
 
-    "fender": "fender",
-    "hood": "hood",
+    # Mechanical
+    "alternator": "alternator",
 
-    "front bumper": "front bumper",
-    "bumper cover": "front bumper",
-    "rear bumper": "rear bumper",
-
-    "grille": "grille",
-    "front grille": "grille",
-
-    "window regulator": "window regulator",
-    "power window motor": "window regulator",
-    "window motor": "window regulator",
+    "starter": "starter",
+    "starter motor": "starter",
 
     "ac compressor": "ac compressor",
     "a/c compressor": "ac compressor",
     "air conditioning compressor": "ac compressor",
 
-    "steering wheel": "steering wheel",
+    "power steering pump": "power steering pump",
+    "ps pump": "power steering pump",
+
+    "catalytic converter": "catalytic converter",
+    "cat converter": "catalytic converter",
+    "catalytic": "catalytic converter",
+
+    "radiator": "radiator",
+
+    "blower motor": "blower motor",
+    "hvac blower": "blower motor",
+    "heater blower": "blower motor",
+
+    "strut": "strut",
+    "strut assembly": "strut",
+    "shock absorber": "strut",
+    "front strut": "strut",
+    "rear strut": "strut",
+
+    # Wheels / glass
+    "wheel": "wheel",
+    "rim": "wheel",
+
+    "window regulator": "window regulator",
+    "power window motor": "window regulator",
+    "window motor": "window regulator",
 }
 
 # =========================================================
 # Part to Category mapping
-# Raw Part term -> normalized comparison term to get category 
+# Normalized alias -> taxonomy category name
 # =========================================================
 PART_CATEGORY_MAP = {
+    # Lighting
     "headlight": "Headlight Assembly",
     "tail light": "Tail Light Assembly",
+    "fog light": "Fog Light Assembly",
+    # Exterior body
     "mirror": "Side Mirror",
-    "radio": "Radio / Infotainment",
-    "instrument cluster": "Instrument Cluster",
-    "alternator": "Alternator",
-    "starter": "Starter",
-    "ecu": "Engine Control Module",
-    "tcm": "Transmission Control Module",
-    "wheel": "Wheel / Rim",
-    "seat": "Seat",
     "door": "Door Assembly",
     "fender": "Fender",
     "hood": "Hood",
     "front bumper": "Front Bumper Assembly",
     "rear bumper": "Rear Bumper Assembly",
     "grille": "Grille",
-    "window regulator": "Window Regulator",
-    "ac compressor": "AC Compressor",
+    "liftgate": "Liftgate",
+    "tailgate": "Tailgate",
+    # Interior
+    "radio": "Radio / Infotainment",
+    "instrument cluster": "Instrument Cluster",
+    "seat": "Seat",
     "steering wheel": "Steering Wheel",
+    # Electronics / modules
+    "ecu": "Engine Control Module",
+    "tcm": "Transmission Control Module",
+    "abs module": "ABS Module",
+    "bcm": "Body Control Module",
+    "ignition coil": "Ignition Coil",
+    # Mechanical
+    "alternator": "Alternator",
+    "starter": "Starter",
+    "ac compressor": "AC Compressor",
+    "power steering pump": "Power Steering Pump",
+    "catalytic converter": "Catalytic Converter",
+    "radiator": "Radiator",
+    "blower motor": "Blower Motor",
+    "strut": "Strut / Shock",
+    # Wheels / glass
+    "wheel": "Wheel / Rim",
+    "window regulator": "Window Regulator",
 }

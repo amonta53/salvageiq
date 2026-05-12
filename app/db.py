@@ -116,11 +116,12 @@ def init_db() -> None:
 # =========================================================
 
 def _seed_pull_profiles(conn: sqlite3.Connection) -> None:
-    """Insert pull profiles from net_value.py if the table is empty."""
-    count = conn.execute("SELECT COUNT(*) FROM part_pull_profiles").fetchone()[0]
-    if count > 0:
-        return
+    """
+    Upsert pull profiles from net_value.py into the DB.
 
+    Uses INSERT OR IGNORE so existing rows are left untouched and
+    newly added profiles are inserted automatically on each startup.
+    """
     from app.net_value import PULL_PROFILES
 
     now = datetime.now(timezone.utc).isoformat()
