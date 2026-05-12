@@ -390,6 +390,20 @@ def estimate_net_value(
 
 
 # =========================================================
+# Recommendation thresholds by risk tolerance
+# =========================================================
+
+THRESHOLDS: dict[str, dict[str, float]] = {
+    #            pull_net  pull_str  maybe_net
+    "low":    {"pull_net": 100.0, "pull_str": 0.60, "maybe_net": 50.0},
+    "medium": {"pull_net":  75.0, "pull_str": 0.50, "maybe_net": 25.0},
+    "high":   {"pull_net":  50.0, "pull_str": 0.35, "maybe_net": 15.0},
+}
+
+_DEFAULT_THRESHOLDS = THRESHOLDS["medium"]
+
+
+# =========================================================
 # Recommendation logic
 # =========================================================
 
@@ -397,21 +411,25 @@ def recommend(
     estimated_net_value: float | None,
     sell_through_rate: float | None,
     confidence_score: float | None,
+    risk_tolerance: str | None = None,
 ) -> str:
     """
-    Return Pull, Maybe, or Skip based on net value, STR, and confidence.
+    Return Pull, Maybe, or Skip based on net value, STR, confidence,
+    and the user's risk tolerance setting.
+
+    risk_tolerance: 'low' | 'medium' | 'high'  (defaults to 'medium')
     """
     if estimated_net_value is None:
         return "Skip"
 
+    t    = THRESHOLDS.get(risk_tolerance or "medium", _DEFAULT_THRESHOLDS)
     net  = estimated_net_value
     str_ = sell_through_rate or 0.0
-    conf = confidence_score or 0.0
 
-    if net >= 75 and str_ >= 0.50:
+    if net >= t["pull_net"] and str_ >= t["pull_str"]:
         return "Pull"
 
-    if net >= 25 and (net < 75 or str_ < 0.50 or conf < 0.50):
+    if net >= t["maybe_net"]:
         return "Maybe"
 
     return "Skip"
@@ -455,8 +473,9 @@ def enrich_item(
     except (TypeError, ValueError):
         conf_val = None
 
+    risk      = (settings or {}).get("risk_tolerance", "medium")
     net_value = estimate_net_value(median_price, profile, settings)
-    verdict   = recommend(net_value, str_val, conf_val)
+    verdict   = recommend(net_value, str_val, conf_val, risk_tolerance=risk)
 
     return {
         **item,
