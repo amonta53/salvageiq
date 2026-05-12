@@ -66,6 +66,22 @@ def normalize_vehicle_input(
     )
 
 
+def build_vehicle_key(vehicle: VehicleIdentity) -> str:
+    """
+    Build a stable, lowercase cache key from a vehicle identity.
+
+    Example: 2017|chrysler|pacifica|touring
+    """
+    parts = [
+        str(vehicle.year),
+        (vehicle.make or "").strip().lower(),
+        (vehicle.model or "").strip().lower(),
+        (vehicle.trim or "").strip().lower(),
+    ]
+    # strip trailing empty segment when trim is absent
+    return "|".join(p for p in parts if p)
+
+
 def decode_vin_with_nhtsa(vin: str) -> VehicleIdentity:
     """
     Decode a VIN using the NHTSA vPIC API.

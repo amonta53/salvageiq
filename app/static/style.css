@@ -2,6 +2,9 @@ body {
   background: #f6f7f9;
 }
 
+/* =========================================================
+   Hero
+   ========================================================= */
 .hero {
   background: linear-gradient(135deg, #172033, #243b55);
   color: white;
@@ -17,11 +20,64 @@ body {
 .small-card {
   background: rgba(255, 255, 255, 0.12);
   border: 1px solid rgba(255, 255, 255, 0.2);
+  color: white;
 }
 
+/* =========================================================
+   Table
+   ========================================================= */
 .table thead th {
   font-size: 0.8rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: #667085;
+}
+
+/* =========================================================
+   Verdict badges
+   ========================================================= */
+.badge-pull {
+  background-color: #198754;
+  color: #fff;
+  font-size: 0.75rem;
+  padding: 0.3em 0.65em;
+  border-radius: 0.35rem;
+}
+
+.badge-maybe {
+  background-color: #fd7e14;
+  color: #fff;
+  font-size: 0.75rem;
+  padding: 0.3em 0.65em;
+  border-radius: 0.35rem;
+}
+
+.badge-skip {
+  background-color: #6c757d;
+  color: #fff;
+  font-size: 0.75rem;
+  padding: 0.3em 0.65em;
+  border-radius: 0.35rem;
+}
+
+/* =========================================================
+   Progress bar
+   ========================================================= */
+.progress-bar {
+  background-color: #2ea3f2;
+}
+
+/* =========================================================
+   Difficulty dots
+   ========================================================= */
+.dot-filled {
+  color: #1f3a5f;
+  font-size: 0.65rem;
+  letter-spacing: 0.05em;
+}
+
+.dot-empty {
+  color: #d1d5db;
+  font-size: 0.65rem;
+  letter-spacing: 0.05em;
 }

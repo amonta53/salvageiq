@@ -1,22 +1,14 @@
 # =========================================================
 # salvage_service.py
 # Application service layer for SalvageIQ
-#
-# Purpose:
-# Tie vehicle identity to the existing scrape/analyze/rank pipeline.
-# This is the boundary between the web app and the capstone pipeline.
-#
-# Notes:
-# - Keeps FastAPI endpoints thin
-# - Keeps pipeline-specific code out of the UI
-# - Uses one vehicle, one model year, full configured part list
 # =========================================================
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import logging
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -24,7 +16,16 @@ from config.config_builder import build_scrape_config
 from config.taxonomy import SEARCH_PART_TERMS
 from pipeline.orchestrator import run_pipeline
 
-from app.vehicle_lookup import VehicleIdentity, normalize_vehicle_input
+from app.db import (
+    complete_result_set,
+    create_result_set,
+    get_db,
+    insert_result_items,
+    update_job,
+)
+from app.net_value import enrich_item
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -37,81 +38,91 @@ class SalvageIQRequest:
     vin: str | None = None
     top_n: int = 10
     max_pages_per_search: int = 2
+    window_days: int = 90
 
 
-@dataclass(slots=True)
-class SalvageIQResult:
-    """Response returned to the web/API layer."""
-
-    run_id: str
-    vehicle: dict[str, Any]
-    ranked_parts: list[dict[str, Any]]
-    ranked_output_path: str
-    caveats: list[str]
-
-
-def run_vehicle_lookup(request: SalvageIQRequest) -> SalvageIQResult:
+def run_vehicle_analysis(
+    job_id: str,
+    vehicle_key: str,
+    request: SalvageIQRequest,
+) -> None:
     """
-    Run a one-vehicle SalvageIQ lookup and return ranked part opportunities.
-
-    This creates a focused ScrapeConfig:
-    - one vehicle
-    - one model year
-    - softcoded SEARCH_PART_TERMS list
-    - sold pass plus active market snapshot
-    - ranked top-N output
+    Background task: run the full pipeline, update job progress, and persist results.
     """
-    vehicle = normalize_vehicle_input(
-        year=request.year,
-        make=request.make,
-        model=request.model,
-        vin=request.vin,
-    )
 
-    config = build_scrape_config(mode="full")
-    config.start_year = vehicle.year
-    config.end_year = vehicle.year
-    config.supported_vehicles = [
-        {
-            "year_range": (vehicle.year, vehicle.year),
-            "make": vehicle.make,
-            "model": vehicle.model,
-        }
-    ]
-    config.parts = SEARCH_PART_TERMS.copy()
-    config.max_pages_per_search = request.max_pages_per_search
-    config.top_n_parts = request.top_n
-    config.run_hypothesis_test = False
-    config.reset_outputs_on_run = True
-    config.enable_resume = False
+    def progress(message: str, percent: int) -> None:
+        try:
+            with get_db() as conn:
+                update_job(
+                    conn,
+                    job_id,
+                    progress_message=message,
+                    progress_percent=percent,
+                )
+        except Exception:
+            logger.warning("Failed to write job progress for %s", job_id)
 
-    # ScrapeConfig builds make_model_map in __post_init__, but we mutate
-    # supported_vehicles after creation. Rebuild the map explicitly.
-    config.make_model_map = {vehicle.make: [vehicle.model]}
+    try:
+        with get_db() as conn:
+            update_job(conn, job_id, status="running", progress_message="Starting scrape job...", progress_percent=5)
 
-    run_pipeline(config)
+        config = build_scrape_config(mode="full")
+        config.start_year = request.year
+        config.end_year = request.year
+        config.supported_vehicles = [
+            {
+                "year_range": (request.year, request.year),
+                "make": request.make,
+                "model": request.model,
+            }
+        ]
+        config.parts = SEARCH_PART_TERMS.copy()
+        config.max_pages_per_search = request.max_pages_per_search
+        config.top_n_parts = request.top_n
+        config.run_hypothesis_test = False
+        config.reset_outputs_on_run = True
+        config.enable_resume = False
+        config.make_model_map = {request.make: [request.model]}
 
-    top_path = config.top_10_output_csv_path
-    ranked_parts = _load_ranked_parts(top_path)
+        progress("Scraping sold listings...", 15)
+        run_pipeline(config)
+        progress("Scoring results...", 80)
 
-    return SalvageIQResult(
-        run_id=config.run_id,
-        vehicle=vehicle.to_dict(),
-        ranked_parts=ranked_parts,
-        ranked_output_path=str(top_path),
-        caveats=[
-            "Sell-through rate is an approximation based on sold listing count versus active listing count.",
-            "eBay sold listings are treated as a recent market window; verify exact listing dates before using this for high-dollar buying decisions.",
-            "Softcoded part terms are broad, so fitment and trim-specific compatibility still need a human sanity check.",
-        ],
-    )
+        top_path = config.top_10_output_csv_path
+        ranked_parts = [enrich_item(item) for item in _load_ranked_parts(top_path)]
+
+        progress("Saving results...", 90)
+        with get_db() as conn:
+            result_set_id = create_result_set(conn, vehicle_key=vehicle_key)
+            insert_result_items(conn, result_set_id, ranked_parts)
+            complete_result_set(conn, result_set_id)
+            update_job(
+                conn,
+                job_id,
+                status="completed",
+                progress_message="Complete.",
+                progress_percent=100,
+                result_set_id=result_set_id,
+            )
+
+    except Exception as exc:
+        logger.exception("Job %s failed", job_id)
+        try:
+            with get_db() as conn:
+                update_job(
+                    conn,
+                    job_id,
+                    status="failed",
+                    error_message=str(exc),
+                    progress_message="Job failed.",
+                )
+        except Exception:
+            pass
 
 
 def _load_ranked_parts(path: Path) -> list[dict[str, Any]]:
-    """Load ranked parts CSV and convert NaN values to JSON-friendly nulls."""
     if not path.exists():
         raise FileNotFoundError(f"Ranked output was not created: {path}")
-
     df = pd.read_csv(path)
     df = df.where(pd.notnull(df), None)
     return df.to_dict(orient="records")
