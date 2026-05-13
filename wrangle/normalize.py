@@ -35,7 +35,6 @@ from config.schema import (
     NORMALIZATION_REQUIRED_INPUT_COLUMNS,
 )
 from config.vehicles import MAKE_ALIASES, MODEL_ALIASES 
-from utils.io_utils import ensure_csv_with_headers 
 
 logger = logging.getLogger(__name__)
 
@@ -229,24 +228,33 @@ def deduplicate_listings(df: pd.DataFrame) -> pd.DataFrame:
 
 
 
-def run_normalization(cleansed_csv_path: str, normalized_csv_path: str) -> pd.DataFrame:
+def run_normalization(cleansed_df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     """
-    Run the normalization step on the cleansed dataset.
+    Run the normalization step on a cleansed listing DataFrame.
+
+    Parameters
+    ----------
+    cleansed_df : pd.DataFrame
+        Output from run_cleansing().
+
+    Returns
+    -------
+    tuple[pd.DataFrame, dict]
+        normalized_df: Standardized and deduplicated DataFrame.
+        dedup_stats:   {"removed_count", "removed_rate", ...}
 
     Processing overview
     -------------------
-    1. Load the cleansed CSV.
-    2. Ensure expected input columns exist.
-    3. Standardize make, model, and part fields.
-    4. Classify part text into stable taxonomy categories.
-    5. Remove query-string suffixes from listing URLs.
-    6. Write the normalized dataset to disk.
+    1. Ensure expected input columns exist.
+    2. Standardize make, model, and part fields.
+    3. Classify part text into stable taxonomy categories.
+    4. Remove query-string suffixes from listing URLs.
+    5. Deduplicate listings.
     """
     # =========================================================
-    # Stage 1: Load and validate input
+    # Stage 1: Validate and pad input
     # =========================================================
-    ensure_csv_with_headers(normalized_csv_path, NORMALIZED_COLUMNS)
-    df = pd.read_csv(cleansed_csv_path)
+    df = cleansed_df.copy()
 
     # Ensure normalization can run even if upstream optional columns
     # are missing from the cleansed dataset.
@@ -255,9 +263,7 @@ def run_normalization(cleansed_csv_path: str, normalized_csv_path: str) -> pd.Da
             df[column_name] = pd.NA
 
     if df.empty:
-        df = df.reindex(columns=NORMALIZED_COLUMNS)
-        df.to_csv(normalized_csv_path, index=False)
-        return df, {"removed_count": 0, "removed_rate": 0.0}
+        return df.reindex(columns=NORMALIZED_COLUMNS), {"removed_count": 0, "removed_rate": 0.0}
     
     # =========================================================
     # Stage 2: Standardization (make, model, part)
@@ -304,8 +310,4 @@ def run_normalization(cleansed_csv_path: str, normalized_csv_path: str) -> pd.Da
     # =========================================================
     df, dedup_stats = deduplicate_listings(df)
 
-    # =========================================================
-    # Stage 8: Output
-    # =========================================================
-    df.to_csv(normalized_csv_path, index=False)
     return df, dedup_stats

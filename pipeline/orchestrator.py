@@ -24,6 +24,8 @@ from utils.logging_utils import setup_logging
 from wrangle.cleanse import run_cleansing
 from wrangle.normalize import run_normalization
 
+# dataclasses.replace used by build_stage_configs — keep this import
+
 
 # =========================================================
 # Setup helpers
@@ -47,20 +49,10 @@ def reset_pipeline_outputs(config: ScrapeConfig, logger: logging.Logger) -> None
     if not config.reset_outputs_on_run:
         return
 
-    logger.info("Reset flag is on — clearing old output files.")
+    logger.info("Reset flag is on — clearing checkpoint.")
 
-    for path in [
-        config.raw_csv_path,
-        config.market_summary_csv_path,
-        config.cleansed_csv_path,
-        config.normalized_csv_path,
-        config.eda_summary_csv_path,
-        config.checkpoint_path,
-        config.analysis_summary_csv_path,
-        config.full_ranked_output_csv_path,
-        config.top_10_output_csv_path,
-    ]:
-        reset_output_file(path)
+    # Pipeline data is all in-memory now; only the checkpoint file persists on disk.
+    reset_output_file(config.checkpoint_path)
 
 
 def build_stage_configs(config: ScrapeConfig) -> tuple[ScrapeConfig, ScrapeConfig]:
@@ -73,33 +65,38 @@ def build_stage_configs(config: ScrapeConfig) -> tuple[ScrapeConfig, ScrapeConfi
 # Stage wrappers
 # =========================================================
 
-def run_sold_scrape_stage(config: ScrapeConfig, logger: logging.Logger) -> dict:
+def run_sold_scrape_stage(
+    config: ScrapeConfig, logger: logging.Logger
+) -> tuple[pd.DataFrame, dict]:
     logger.info("Stage start | sold scrape")
-    result = run_scrape(config)
-    logger.info("Stage complete | sold scrape | rows_collected=%s", result.get("total_rows", 0))
-    return result
+    raw_df, _market_df, stats = run_scrape(config)
+    logger.info("Stage complete | sold scrape | rows_collected=%s", stats.get("total_rows", 0))
+    return raw_df, stats
 
 
-def run_active_scrape_stage(config: ScrapeConfig, logger: logging.Logger) -> dict:
+def run_active_scrape_stage(
+    config: ScrapeConfig, logger: logging.Logger
+) -> tuple[pd.DataFrame, dict]:
     logger.info("Stage start | active scrape")
-    result = run_scrape(config)
-    logger.info("Stage complete | active scrape | rows_collected=%s", result.get("total_rows", 0))
-    return result
+    _raw_df, market_df, stats = run_scrape(config)
+    logger.info("Stage complete | active scrape | rows_collected=%s", stats.get("total_rows", 0))
+    return market_df, stats
 
 
-def run_cleansing_stage(config: ScrapeConfig, logger: logging.Logger) -> pd.DataFrame:
+def run_cleansing_stage(
+    raw_df: pd.DataFrame, logger: logging.Logger
+) -> pd.DataFrame:
     logger.info("Stage start | cleansing")
-    cleansed_df = run_cleansing(config.raw_csv_path, config.cleansed_csv_path)
+    cleansed_df = run_cleansing(raw_df)
     logger.info("Stage complete | cleansing | rows_out=%s", len(cleansed_df))
     return cleansed_df
 
 
-def run_normalization_stage(config: ScrapeConfig, logger: logging.Logger):
+def run_normalization_stage(
+    cleansed_df: pd.DataFrame, logger: logging.Logger
+) -> tuple[pd.DataFrame, dict]:
     logger.info("Stage start | normalization")
-    normalized_df, dedup_stats = run_normalization(
-        config.cleansed_csv_path,
-        config.normalized_csv_path,
-    )
+    normalized_df, dedup_stats = run_normalization(cleansed_df)
     logger.info(
         "Stage complete | normalization | rows_out=%s | duplicates_removed=%s",
         len(normalized_df),
@@ -108,12 +105,16 @@ def run_normalization_stage(config: ScrapeConfig, logger: logging.Logger):
     return normalized_df, dedup_stats
 
 
-def run_analysis_stage(config: ScrapeConfig, logger: logging.Logger):
+def run_analysis_stage(
+    normalized_df: pd.DataFrame,
+    market_df: pd.DataFrame,
+    config: ScrapeConfig,
+    logger: logging.Logger,
+) -> dict:
     logger.info("Stage start | analysis summary")
     analysis_result = run_analysis(
-        sold_csv_path=config.normalized_csv_path,
-        active_csv_path=config.market_summary_csv_path,
-        output_csv_path=config.analysis_summary_csv_path,
+        sold_df=normalized_df,
+        active_df=market_df,
         config=config,
     )
     logger.info(
@@ -127,37 +128,47 @@ def run_analysis_stage(config: ScrapeConfig, logger: logging.Logger):
 # Main orchestrator
 # =========================================================
 
-def run_pipeline(config: ScrapeConfig) -> None:
+def run_pipeline(config: ScrapeConfig) -> dict:
     """
     Run the end-to-end SalvageIQ pipeline for one configured execution.
 
+    All data flows in memory — no intermediate CSV files are written.
+    Only the log file (and optional checkpoint) are written to disk.
+
     Flow:
     1. Initialize logging
-    2. Reset output files if configured
+    2. Reset checkpoint if configured
     3. Scrape sold listings + active market snapshot (concurrent httpx)
     4. Cleanse → normalize sold listings
     5. Build analysis summary + ranked outputs
+
+    Returns
+    -------
+    dict with keys:
+        "analysis_df"    — formatted analysis summary
+        "top_ranked_df"  — top-N ranked parts per vehicle
+        "full_ranked_df" — all ranked parts per vehicle
     """
     logger = initialize_pipeline(config)
     reset_pipeline_outputs(config, logger)
 
     sold_config, all_config = build_stage_configs(config)
 
-    run_sold_scrape_stage(sold_config, logger)
-    run_active_scrape_stage(all_config, logger)
+    raw_df, _sold_stats = run_sold_scrape_stage(sold_config, logger)
+    market_df, _active_stats = run_active_scrape_stage(all_config, logger)
 
-    run_cleansing_stage(sold_config, logger)
-    normalized_df, _ = run_normalization_stage(config, logger)
-    analysis_result = run_analysis_stage(config, logger)
-
-    analysis_df = analysis_result["analysis_df"]
+    cleansed_df = run_cleansing_stage(raw_df, logger)
+    normalized_df, _ = run_normalization_stage(cleansed_df, logger)
+    analysis_result = run_analysis_stage(normalized_df, market_df, config, logger)
 
     logger.info("=" * 70)
     logger.info(
         "Pipeline complete | run_id=%s | normalized_rows=%s | summary_rows=%s | mode=%s",
         config.run_id,
         len(normalized_df),
-        len(analysis_df),
+        len(analysis_result["analysis_df"]),
         config.mode,
     )
     logger.info("=" * 70)
+
+    return analysis_result

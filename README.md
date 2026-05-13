@@ -175,21 +175,11 @@ salvageiq/
 ├── data/
 │   └── runs/
 │       └── <run_id>/
-│           ├── raw/
-│           │   ├── raw_listings.csv
-│           │   └── scrape_checkpoint.json
-│           ├── processed/
-│           │   ├── cleansed_listings.csv
-│           │   ├── normalized_listings.csv
-│           │   └── market_summary.csv
 │           └── outputs/
-│               ├── analysis/
-│               │   ├── analysis_summary.csv
-│               │   ├── ranked_parts_all.csv
-│               │   └── ranked_parts_top10.csv
 │               └── logs/
 │                   ├── pipeline_<run_id>.log
-│                   └── scrape_run.log
+│                   ├── scrape_run.log
+│                   └── scrape_checkpoint.json  # only when resume is enabled
 │
 ├── assets/
 │   ├── logo_main.png        # Horizontal logo (light background)
@@ -206,26 +196,20 @@ salvageiq/
 
 ## Data Flow
 
-Each pipeline run is fully isolated under a unique `run_id` (UUID).
+Each pipeline run is fully isolated under a unique `run_id` (UUID). All data moves between stages **in memory** — no intermediate files are written to disk.
 
 ```
-eBay (sold pass)   ──► raw_listings.csv
-eBay (active pass) ──► market_summary.csv
+eBay (sold pass)   ──► raw_df (DataFrame, in memory)
+eBay (active pass) ──► market_df (DataFrame, in memory)
                            │
                      cleanse.py
-                           │
-                     cleansed_listings.csv
-                           │
+                           │ (DataFrame)
                      normalize.py
-                           │
-                     normalized_listings.csv
-                           │
-                     aggregation.py  ◄── market_summary.csv
-                           │
-                     analysis_summary.csv
-                     ranked_parts_all.csv
-                     ranked_parts_top10.csv
-                           │
+                           │ (DataFrame)
+                     aggregation.py  ◄── market_df
+                           │ (DataFrame)
+                     ranking.py
+                           │ (DataFrame)
                      salvage_service.py
                            │
                      SQLite (result_sets, result_items)
@@ -233,7 +217,9 @@ eBay (active pass) ──► market_summary.csv
                      FastAPI → browser UI
 ```
 
-**Sold and active are scraped as separate passes.** The sold pass feeds the full cleanse → normalize → analysis path. The active pass writes a compact market summary that is joined to sold data during aggregation to compute sell-through rates.
+The only things written to disk per run are the log files (and a checkpoint file if resume is enabled), stored under `data/runs/<run_id>/outputs/logs/`.
+
+**Sold and active are scraped as separate passes.** The sold pass feeds the full cleanse → normalize → analysis path. The active pass captures current market supply and is joined to sold data during aggregation to compute sell-through rates.
 
 **The scraper is fully concurrent.** All part searches for a given vehicle run simultaneously via `asyncio.gather` with a connection semaphore. eBay search pages are server-side rendered, so no browser is needed — `httpx` + `BeautifulSoup` replace the old Playwright approach. A full vehicle analysis that previously took ~3 minutes now completes in ~15–25 seconds.
 
@@ -297,16 +283,19 @@ The API checks SQLite for a recent result set before firing a scrape job. Result
 ### 2. Async HTTP Scraping
 The scraper uses `httpx.AsyncClient` with `asyncio.gather` to run all part searches concurrently. eBay search result pages are server-side rendered, so no browser execution is needed. A configurable semaphore limits simultaneous connections to avoid rate limiting.
 
-### 3. Run-Isolated Directory Structure
-Each pipeline run writes to its own directory under `data/runs/<run_id>/`. This makes it safe to run multiple analyses without overwriting results, and supports checkpoint/resume for interrupted runs.
+### 3. In-Memory Pipeline
+All data flows between pipeline stages as DataFrames — no intermediate CSV files are written. The scraper returns DataFrames directly to the cleanse stage, which hands off to normalize, which hands off to analysis. The final ranked results land in SQLite without ever touching disk in between. The only disk writes per run are the log file and an optional checkpoint file for resume support.
 
-### 4. Config-Driven Pipeline
+### 4. Run-Isolated Log Directory
+Each pipeline run gets its own directory under `data/runs/<run_id>/outputs/logs/` for its log file and optional checkpoint. Since all data is in memory, this is the only directory created per run — no accumulating CSV files regardless of usage volume.
+
+### 5. Config-Driven Pipeline
 Vehicles, parts, taxonomy rules, column contracts, and path structures all live in `config/`. No hardcoded paths or magic strings scattered through stage logic.
 
-### 5. Taxonomy-Based Classification
+### 6. Taxonomy-Based Classification
 Part search terms and classification rules live in `config/taxonomy.py`. Each part category defines include terms and exclude terms (e.g., "alternator" includes `alternator` but excludes `alternator rebuild kit`). This makes the search scope easy to tune without touching scraper logic.
 
-### 6. Checkpoint / Resume
+### 7. Checkpoint / Resume
 Completed searches are written to a checkpoint file after each successful fetch. If a run is interrupted, it can resume from where it left off rather than starting over.
 
 ---

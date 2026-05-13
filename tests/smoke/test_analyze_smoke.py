@@ -3,11 +3,9 @@
 # Smoke tests for analysis controller flow
 #
 # Purpose:
-# Verify that analyze.py loads inputs, runs the analysis layer,
-# applies final output mapping, and writes the expected CSV.
+# Verify that analyze.py accepts DataFrames, runs the analysis layer,
+# applies final output mapping, and returns the expected structure.
 # =========================================================
-
-from pathlib import Path
 
 import pandas as pd
 
@@ -47,18 +45,16 @@ class DummyConfig:
     }
 
 
+
+
 # =========================================================
 # 1. run_analysis smoke test
 # =========================================================
-def test_run_analysis_writes_expected_output(tmp_path: Path) -> None:
+def test_run_analysis_returns_expected_structure() -> None:
     """
-    Verify the analysis controller reads input files, builds the
-    analysis summary, and writes the final CSV.
+    Verify the analysis controller accepts DataFrames, builds the
+    analysis summary, and returns the expected in-memory structure.
     """
-    sold_csv_path = tmp_path / "normalized.csv"
-    active_csv_path = tmp_path / "market_summary.csv"
-    output_csv_path = tmp_path / "analysis_summary.csv"
-
     sold_df = pd.DataFrame(
         [
             {
@@ -93,25 +89,19 @@ def test_run_analysis_writes_expected_output(tmp_path: Path) -> None:
         ]
     )
 
-    sold_df.to_csv(sold_csv_path, index=False)
-    active_df.to_csv(active_csv_path, index=False)
-
     config = DummyConfig()
-    config.full_ranked_output_csv_path = tmp_path / "ranked_all.csv"
-    config.top_10_output_csv_path = tmp_path / "ranked_top10.csv"
 
     result = run_analysis(
-        sold_csv_path=sold_csv_path,
-        active_csv_path=active_csv_path,
-        output_csv_path=output_csv_path,
+        sold_df=sold_df,
+        active_df=active_df,
         config=config,
     )
 
-    assert output_csv_path.exists()
     assert "analysis_df" in result
-    assert "analysis_output_path" in result
+    assert "top_ranked_df" in result
+    assert "full_ranked_df" in result
 
-    output_df = pd.read_csv(output_csv_path)
+    output_df = result["analysis_df"]
 
     assert len(output_df) == 1
     assert output_df.loc[0, "year"] == 2018

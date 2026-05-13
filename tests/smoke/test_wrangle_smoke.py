@@ -1,93 +1,105 @@
 # =========================================================
 # test_wrangle_smoke.py
-# Smoke test for raw-to-normalized wrangle flow
+# Smoke test for the cleanse → normalize wrangle flow
 #
 # Purpose:
-# Verify the wrangle pipeline can read a tiny raw CSV,
-# normalize listing fields, deduplicate rows, and write
-# the expected normalized output.
+# Verify the wrangle pipeline can accept a raw DataFrame,
+# normalize listing fields, deduplicate rows, and return
+# the expected structure — without any file I/O.
 # =========================================================
-
-from pathlib import Path
 
 import pandas as pd
 
+from wrangle.cleanse import run_cleansing
 from wrangle.normalize import run_normalization
 
 
-def test_wrangle_smoke(tmp_path: Path) -> None:
+def test_wrangle_smoke() -> None:
     """
-    Verify the normalization flow can process a tiny raw input file
-    without relying on artifacts created by other tests.
+    Verify the full cleanse → normalize flow works end-to-end on
+    a small in-memory DataFrame.
 
-    Why this matters:
-    A smoke test should prove the wrangle layer still works end to end.
-    It should not depend on test order, shared files, or prior runs.
+    What this checks:
+    - run_cleansing accepts a raw DataFrame and returns a cleansed one
+    - run_normalization standardizes make/model/part fields
+    - Duplicate listing URLs collapse after canonicalization
+    - Output contains the expected standardized columns
     """
-    raw_csv_path = tmp_path / "raw_test.csv"
-    normalized_csv_path = tmp_path / "normalized_test.csv"
-
     raw_df = pd.DataFrame(
         [
             {
-                "title": "2018 Toyota Camry Alternator OEM",
-                "price": "$125.00",
-                "item_url": "https://www.ebay.com/itm/12345?_trkparms=abc",
+                "run_id": "test-run",
+                "scrape_ts": "2026-04-10 10:00:00",
+                "pass_type": "sold",
                 "search_year": 2018,
                 "search_make": "Toyota",
                 "search_model": "Camry",
                 "search_part": "alternator",
-                "listing_status": "sold",
-                "scrape_ts": "2026-04-10 10:00:00",
+                "search_url": "https://www.ebay.com/sch/i.html?_nkw=alternator",
+                "search_page": 1,
+                "title": "2018 Toyota Camry Alternator OEM",
+                "price_raw": "$125.00",
+                "subtitle": "Free shipping",
+                "listing_url": "https://www.ebay.com/itm/12345?_trkparms=abc",
+                "raw_text": "2018 Toyota Camry Alternator OEM Free shipping",
             },
             {
-                "title": "2018 Toyota Camry Alternator OEM",
-                "price": "$125.00",
-                "item_url": "https://www.ebay.com/itm/12345?_trkparms=xyz",
+                # Same listing URL (different query string) — should deduplicate
+                "run_id": "test-run",
+                "scrape_ts": "2026-04-10 10:00:00",
+                "pass_type": "sold",
                 "search_year": 2018,
                 "search_make": "TOYOTA",
                 "search_model": "camry",
                 "search_part": "alt",
-                "listing_status": "sold",
-                "scrape_ts": "2026-04-10 10:00:00",
+                "search_url": "https://www.ebay.com/sch/i.html?_nkw=alternator",
+                "search_page": 1,
+                "title": "2018 Toyota Camry Alternator OEM",
+                "price_raw": "$125.00",
+                "subtitle": "Free shipping",
+                "listing_url": "https://www.ebay.com/itm/12345?_trkparms=xyz",
+                "raw_text": "2018 Toyota Camry Alternator OEM Free shipping",
             },
             {
-                "title": "2018 Toyota Camry Headlight Assembly",
-                "price": "$210.00",
-                "item_url": "https://www.ebay.com/itm/99999",
+                "run_id": "test-run",
+                "scrape_ts": "2026-04-10 10:00:00",
+                "pass_type": "sold",
                 "search_year": 2018,
                 "search_make": "Toyota",
                 "search_model": "Camry",
-                "search_part": "head light",
-                "listing_status": "active",
-                "scrape_ts": "2026-04-10 10:00:00",
+                "search_part": "headlight",
+                "search_url": "https://www.ebay.com/sch/i.html?_nkw=headlight",
+                "search_page": 1,
+                "title": "2018 Toyota Camry Headlight Assembly",
+                "price_raw": "$210.00",
+                "subtitle": None,
+                "listing_url": "https://www.ebay.com/itm/99999",
+                "raw_text": "2018 Toyota Camry Headlight Assembly",
             },
         ]
     )
 
-    raw_df.to_csv(raw_csv_path, index=False)
+    cleansed_df = run_cleansing(raw_df)
+    normalized_df, dedup_stats = run_normalization(cleansed_df)
 
-    normalized_df = run_normalization(
-        input_csv_path=raw_csv_path,
-        output_csv_path=normalized_csv_path,
-    )
-
-    assert normalized_csv_path.exists()
     assert not normalized_df.empty
 
-    # Duplicate URLs should collapse after canonicalization
-    assert len(normalized_df) == 2
+    # Two distinct listing URLs after query-string stripping
+    assert len(normalized_df) == 2, (
+        f"Expected 2 rows after dedup, got {len(normalized_df)}"
+    )
+    assert dedup_stats["removed_count"] == 1
 
     alternator_row = normalized_df.loc[
-        normalized_df["item_url"].str.contains("/itm/12345", na=False)
+        normalized_df["listing_url"].str.contains("/itm/12345", na=False)
     ].iloc[0]
 
-    assert alternator_row["search_make_std"] == "toyota"
-    assert alternator_row["search_model_std"] == "camry"
+    assert alternator_row["search_make_std"] == "Toyota"
+    assert alternator_row["search_model_std"] == "Camry"
     assert alternator_row["search_part_std"] == "alternator"
 
     headlight_row = normalized_df.loc[
-        normalized_df["item_url"].str.contains("/itm/99999", na=False)
+        normalized_df["listing_url"].str.contains("/itm/99999", na=False)
     ].iloc[0]
 
     assert headlight_row["search_part_std"] == "headlight"

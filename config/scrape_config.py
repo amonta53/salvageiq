@@ -135,7 +135,7 @@ class ScrapeConfig:
 
     @property
     def checkpoint_path(self) -> Path:
-        return self.raw_dir / "scrape_checkpoint.json"
+        return self.logs_dir / "scrape_checkpoint.json"
 
     @property
     def cleansed_csv_path(self) -> Path:

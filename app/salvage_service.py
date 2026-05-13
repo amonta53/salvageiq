@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
@@ -80,22 +79,22 @@ def run_vehicle_analysis(
         config.parts = SEARCH_PART_TERMS.copy()
         config.max_pages_per_search = request.max_pages_per_search
         config.top_n_parts = request.top_n
-        config.run_hypothesis_test = False
         config.reset_outputs_on_run = True
         config.enable_resume = False
         config.make_model_map = {request.make: [request.model]}
 
         progress("Scraping sold listings...", 15)
-        run_pipeline(config)
+        analysis_result = run_pipeline(config)
         progress("Scoring results...", 80)
 
         with get_db() as conn:
             user_settings = get_user_settings(conn)
 
-        top_path = config.top_10_output_csv_path
+        top_df = analysis_result["top_ranked_df"]
+        top_df = top_df.where(pd.notnull(top_df), None)
         ranked_parts = [
             enrich_item(item, settings=user_settings)
-            for item in _load_ranked_parts(top_path)
+            for item in top_df.to_dict(orient="records")
         ]
 
         progress("Saving results...", 90)
@@ -127,9 +126,3 @@ def run_vehicle_analysis(
             pass
 
 
-def _load_ranked_parts(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        raise FileNotFoundError(f"Ranked output was not created: {path}")
-    df = pd.read_csv(path)
-    df = df.where(pd.notnull(df), None)
-    return df.to_dict(orient="records")

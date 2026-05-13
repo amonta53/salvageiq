@@ -40,12 +40,7 @@ from config.scrape_config import ScrapeConfig
 from scrape.extractors import clean_text, looks_like_junk_title
 from scrape.search_builder import build_execution_key, build_search_key, build_search_url
 from utils.checkpoint_utils import append_completed_search, load_completed_searches
-from utils.io_utils import (
-    append_dataframe_to_csv,
-    append_row_to_csv,
-    ensure_csv_with_headers,
-    ensure_directory,
-)
+from utils.io_utils import ensure_directory
 from utils.logging_utils import RunLogger, format_elapsed_hhmmss
 
 
@@ -362,10 +357,10 @@ async def _scrape_one_search(
 async def _run_scrape_async(
     config: ScrapeConfig,
     logger: RunLogger,
-) -> dict[str, int]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
     """
     Core async implementation: build all search tasks, run them concurrently,
-    collect results, and flush to CSV.
+    collect results, and return DataFrames in memory.
     """
     completed_searches = (
         load_completed_searches(config.checkpoint_path) if config.enable_resume else set()
@@ -421,60 +416,63 @@ async def _run_scrape_async(
             )
             append_completed_search(config.checkpoint_path, execution_key)
 
-    # Write raw listing rows in one batch
-    if all_rows:
-        df = pd.DataFrame(all_rows).reindex(columns=RAW_COLUMNS)
-        append_dataframe_to_csv(df, config.raw_csv_path)
-
-    # Write market summary rows individually (small count, preserves column order)
-    for summary in all_summaries:
-        append_row_to_csv(config.market_summary_csv_path, summary, MARKET_SUMMARY_COLUMNS)
-
-    return {
+    raw_df = (
+        pd.DataFrame(all_rows).reindex(columns=RAW_COLUMNS)
+        if all_rows
+        else pd.DataFrame(columns=RAW_COLUMNS)
+    )
+    market_df = (
+        pd.DataFrame(all_summaries).reindex(columns=MARKET_SUMMARY_COLUMNS)
+        if all_summaries
+        else pd.DataFrame(columns=MARKET_SUMMARY_COLUMNS)
+    )
+    stats = {
         "total_rows": len(all_rows),
         "total_searches_run": len(tasks),
         "total_pages_loaded": total_pages,
     }
+    return raw_df, market_df, stats
 
 
 # =========================================================
 # Public entry point (sync, for orchestrator compatibility)
 # =========================================================
 
-def run_scrape(config: ScrapeConfig) -> dict[str, int]:
+def run_scrape(config: ScrapeConfig) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
     """
-    Run the raw scrape stage and return basic scrape totals.
+    Run the raw scrape stage and return results in memory.
 
     This is the sync entry point called by the pipeline orchestrator.
     It bridges to the async implementation via asyncio.run().
 
+    Returns
+    -------
+    tuple[pd.DataFrame, pd.DataFrame, dict]
+        raw_df:    Sold listing rows (RAW_COLUMNS schema)
+        market_df: Active market snapshot rows (MARKET_SUMMARY_COLUMNS schema)
+        stats:     {"total_rows", "total_searches_run", "total_pages_loaded"}
+
     Flow:
-    1. Prepare output folders and CSV headers
-    2. Resume prior work if checkpointing is enabled
+    1. Create logs directory and open run logger
+    2. Resume prior checkpoint if enabled
     3. Run all part searches concurrently with bounded parallelism
-    4. Write collected rows to raw CSV and market summary CSV
-    5. Return totals dict for the orchestrator to log
+    4. Return collected DataFrames and stats (no CSV I/O)
     """
     run_start = time.time()
 
-    ensure_directory(config.run_dir)
-    if config.save_debug_html:
-        ensure_directory(config.debug_dir)
-
-    ensure_csv_with_headers(config.raw_csv_path, RAW_COLUMNS)
-    ensure_csv_with_headers(config.market_summary_csv_path, MARKET_SUMMARY_COLUMNS)
+    # Only the logs directory needs to exist — all data stays in memory
+    ensure_directory(config.logs_dir)
 
     logger = RunLogger(config.scrape_log_path)
 
     logger.log("=" * 72)
     logger.log("STARTING SCRAPE RUN  [async httpx]")
-    logger.log(f"Run ID:   {config.run_id}")
-    logger.log(f"Scope:    {config.search_scope}")
-    logger.log(f"Raw CSV:  {config.raw_csv_path}")
-    logger.log(f"Log:      {config.scrape_log_path}")
+    logger.log(f"Run ID:  {config.run_id}")
+    logger.log(f"Scope:   {config.search_scope}")
+    logger.log(f"Log:     {config.scrape_log_path}")
     logger.log("=" * 72)
 
-    totals = asyncio.run(_run_scrape_async(config, logger))
+    raw_df, market_df, totals = asyncio.run(_run_scrape_async(config, logger))
 
     elapsed = format_elapsed_hhmmss(time.time() - run_start)
     logger.log("=" * 72)
@@ -487,4 +485,4 @@ def run_scrape(config: ScrapeConfig) -> dict[str, int]:
     )
     logger.log("=" * 72)
 
-    return totals
+    return raw_df, market_df, totals

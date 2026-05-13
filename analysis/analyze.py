@@ -9,13 +9,12 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from analysis.aggregation import build_analysis_summary
-from analysis.ranking import build_ranked_outputs, save_ranked_outputs
+from analysis.ranking import build_ranked_outputs
 from config.schema import ANALYSIS_EXPORT_RENAME_MAP, ANALYSIS_OUTPUT_COLUMNS
 
 
@@ -23,45 +22,48 @@ from config.schema import ANALYSIS_EXPORT_RENAME_MAP, ANALYSIS_OUTPUT_COLUMNS
 # Run analysis stage
 # =========================================================
 def run_analysis(
-    sold_csv_path: Path,
-    active_csv_path: Path,
-    output_csv_path: Path,
+    sold_df: pd.DataFrame,
+    active_df: pd.DataFrame,
     config: Any,
 ) -> dict[str, Any]:
     """
-    Run the analysis stage from prepared sold and active CSV files.
+    Run the analysis stage on in-memory sold and active DataFrames.
+
+    Parameters
+    ----------
+    sold_df : pd.DataFrame
+        Normalized sold listing rows (output of run_normalization).
+    active_df : pd.DataFrame
+        Active market snapshot rows (output of active scrape pass).
+    config : Any
+        Pipeline config with confidence scoring and ranking settings.
+
+    Returns
+    -------
+    dict with keys:
+        "analysis_df"     — formatted analysis summary DataFrame
+        "top_ranked_df"   — top-N ranked parts per vehicle
+        "full_ranked_df"  — all ranked parts per vehicle
 
     High-level flow:
-    1. Load input datasets (sold + active)
-    2. Build combined analysis summary (metrics + scoring)
+    1. Build combined analysis summary (metrics + scoring)
+    2. Format for downstream use
     3. Generate ranked outputs (top parts per vehicle)
-    4. Format and export analysis summary
-    5. Return results for downstream use
+    4. Return all results in memory
     """
     logger = logging.getLogger(__name__)
 
     logger.info("=" * 70)
     logger.info("Analysis stage start")
     logger.info("=" * 70)
-
-    # ---------------------------------------------------------
-    # 1. Load input data
-    # ---------------------------------------------------------
-    logger.info("Reading input CSVs")
-    logger.info("sold_csv=%s", sold_csv_path)
-    logger.info("active_csv=%s", active_csv_path)
-
-    sold_df = pd.read_csv(sold_csv_path)
-    active_df = pd.read_csv(active_csv_path)
-
     logger.info(
-        "Input loaded | sold_rows=%s | active_rows=%s",
+        "Input | sold_rows=%s | active_rows=%s",
         len(sold_df),
         len(active_df),
     )
 
     # ---------------------------------------------------------
-    # 2. Build analysis summary (core metrics + scoring)
+    # 1. Build analysis summary (core metrics + scoring)
     # ---------------------------------------------------------
     logger.info("Building analysis summary")
 
@@ -71,66 +73,33 @@ def run_analysis(
         config=config,
     )
 
-    logger.info(
-        "Analysis summary built | rows=%s",
-        len(analysis_df),
-    )
+    logger.info("Analysis summary built | rows=%s", len(analysis_df))
 
     # ---------------------------------------------------------
-    # 3. Format analysis summary for export
+    # 2. Format analysis summary
     # ---------------------------------------------------------
-    logger.info("Formatting analysis summary for export")
-
     analysis_export_df = analysis_df.rename(columns=ANALYSIS_EXPORT_RENAME_MAP)
     analysis_export_df = analysis_export_df.reindex(columns=ANALYSIS_OUTPUT_COLUMNS)
 
     # ---------------------------------------------------------
-    # 4. Write analysis summary output
+    # 3. Generate ranked outputs (final product layer)
     # ---------------------------------------------------------
-    logger.info("Writing analysis summary CSV")
-
-    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
-    analysis_export_df.to_csv(output_csv_path, index=False)
-
-    logger.info(
-        "Analysis summary CSV written | rows=%s | path=%s",
-        len(analysis_export_df),
-        output_csv_path,
-    )
-
-    # ---------------------------------------------------------
-    # 5. Generate ranked outputs (final product layer)
-    # ---------------------------------------------------------
-    logger.info(
-        "Generating ranked outputs | top_n=%s",
-        config.top_n_parts,
-    )
-
+    logger.info("Generating ranked outputs | top_n=%s", config.top_n_parts)
     logger.info("Ranking input columns: %s", sorted(analysis_df.columns.tolist()))
-    logger.info("Ranking input preview:\n%s", analysis_df.head())
 
     full_ranked_df, top_ranked_df = build_ranked_outputs(
         analysis_df=analysis_df,
         top_n=config.top_n_parts,
     )
 
-    save_ranked_outputs(
-        full_ranked_df=full_ranked_df,
-        top_ranked_df=top_ranked_df,
-        full_output_path=config.full_ranked_output_csv_path,
-        top_output_path=config.top_10_output_csv_path,
-    )
-
     logger.info(
-        "Ranked outputs written | full=%s | top=%s",
-        config.full_ranked_output_csv_path,
-        config.top_10_output_csv_path,
+        "Ranked outputs built | full_rows=%s | top_rows=%s",
+        len(full_ranked_df),
+        len(top_ranked_df),
     )
 
-    # ---------------------------------------------------------
-    # 6. Return results for pipeline continuity
-    # ---------------------------------------------------------
     return {
         "analysis_df": analysis_export_df,
-        "analysis_output_path": output_csv_path,
+        "top_ranked_df": top_ranked_df,
+        "full_ranked_df": full_ranked_df,
     }

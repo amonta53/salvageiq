@@ -15,15 +15,13 @@
 #     - output file creation
 # =========================================================
 
-from pathlib import Path
-
 import pandas as pd
 
 from config.schema import NORMALIZED_COLUMNS
 from wrangle.normalize import run_normalization
 
 
-def test_run_normalization_standardizes_strips_url_and_deduplicates(tmp_path: Path) -> None:
+def test_run_normalization_standardizes_strips_url_and_deduplicates() -> None:
     """
     run_normalization should produce a normalized output with:
     - expected columns
@@ -31,10 +29,7 @@ def test_run_normalization_standardizes_strips_url_and_deduplicates(tmp_path: Pa
     - URL query strings removed
     - duplicate rows collapsed
     """
-    input_csv = tmp_path / "cleansed_input.csv"
-    output_csv = tmp_path / "normalized_output.csv"
-
-    df = pd.DataFrame(
+    cleansed_df = pd.DataFrame(
         [
             {
                 "run_id": "20260411_091200",
@@ -67,12 +62,9 @@ def test_run_normalization_standardizes_strips_url_and_deduplicates(tmp_path: Pa
         ]
     )
 
-    df.to_csv(input_csv, index=False)
-
-    normalized_df, normalization_stats = run_normalization(input_csv, output_csv)
+    normalized_df, normalization_stats = run_normalization(cleansed_df)
 
     assert not normalized_df.empty
-    assert output_csv.exists()
 
     for column_name in NORMALIZED_COLUMNS:
         assert column_name in normalized_df.columns
