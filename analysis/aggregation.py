@@ -227,35 +227,37 @@ def build_analysis_summary(
     )
 
     # =========================================================
-    # Build STR and confidence metrics
+    # Build STR and confidence metrics (vectorized)
     # =========================================================
-    analysis_df["str"] = analysis_df.apply(
-        lambda row: calculate_str(
-            sold_count=int(row["sold_count"]),
-            active_count=int(row["active_count"]),
-        ),
-        axis=1,
+    total_count = analysis_df["sold_count"] + analysis_df["active_count"]
+    analysis_df["str"] = (
+        analysis_df["sold_count"]
+        .div(total_count.where(total_count > 0, other=pd.NA))
+        .fillna(0.0)
+        .round(4)
     )
 
-    analysis_df["confidence_score"] = analysis_df.apply(
-        lambda row: calculate_confidence_score(
-            sold_count=int(row["sold_count"]),
-            active_count=int(row["active_count"]),
-            config=config,
-        ),
-        axis=1,
+    sold_component = (
+        analysis_df["sold_count"]
+        .div(config.confidence_sold_target)
+        .clip(upper=config.confidence_max_score)
+    )
+    active_component = (
+        analysis_df["active_count"]
+        .div(config.confidence_active_target)
+        .clip(upper=config.confidence_max_score)
+    )
+    analysis_df["confidence_score"] = (
+        (sold_component * config.confidence_sold_weight
+         + active_component * config.confidence_active_weight)
+        .round(4)
     )
 
-    analysis_df["opportunity_score"] = analysis_df.apply(
-        lambda row: calculate_opportunity_score(
-            median_price=float(row["median_sold_price"])
-            if pd.notna(row["median_sold_price"])
-            else 0.0,
-            str_value=float(row["str"]),
-            confidence_score=float(row["confidence_score"]),
-        ),
-        axis=1,
-    ) 
+    median_price = analysis_df["median_sold_price"].fillna(0.0)
+    analysis_df["opportunity_score"] = (
+        (median_price * analysis_df["str"] * analysis_df["confidence_score"])
+        .round(4)
+    )
 
     # =========================================================
     # Clean timestamp fields
