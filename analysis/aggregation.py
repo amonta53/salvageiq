@@ -261,15 +261,20 @@ def build_analysis_summary(
 
     # =========================================================
     # Clean timestamp fields
+    # utc=True ensures both columns share the same dtype
+    # (datetime64[ns, UTC]) so the subtraction never hits a
+    # tz-naive vs tz-aware mismatch when active rows are absent.
     # =========================================================
     analysis_df["sold_timestamp"] = pd.to_datetime(
         analysis_df["sold_timestamp"],
         errors="coerce",
+        utc=True,
     )
 
     analysis_df["active_timestamp"] = pd.to_datetime(
         analysis_df["timestamp"],
         errors="coerce",
+        utc=True,
     )
 
     analysis_df["time_diff_hours"] = (
