@@ -23,10 +23,10 @@ class DummyConfig:
     confidence_sold_weight = 0.7
     confidence_active_weight = 0.3
     confidence_max_score = 1.0
-    confidence_min_sample_flag = 3
     stale_snapshot_hours = 48
     low_sample_total_threshold = 5
     very_low_sold_threshold = 3
+    top_n_parts = 10
 
     sold_column_map = {
         "year": "search_year",
@@ -96,11 +96,15 @@ def test_run_analysis_writes_expected_output(tmp_path: Path) -> None:
     sold_df.to_csv(sold_csv_path, index=False)
     active_df.to_csv(active_csv_path, index=False)
 
+    config = DummyConfig()
+    config.full_ranked_output_csv_path = tmp_path / "ranked_all.csv"
+    config.top_10_output_csv_path = tmp_path / "ranked_top10.csv"
+
     result = run_analysis(
         sold_csv_path=sold_csv_path,
         active_csv_path=active_csv_path,
         output_csv_path=output_csv_path,
-        config=DummyConfig(),
+        config=config,
     )
 
     assert output_csv_path.exists()

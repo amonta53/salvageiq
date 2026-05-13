@@ -1,25 +1,14 @@
 # =========================================================
 # test_imports.py
 # Smoke test for SalvageIQ package imports.
-# Purpose:
-#   Verify that key config modules and objects import cleanly
-#   and pass a few basic sanity checks.
 # =========================================================
 
 def test_import_smoke() -> None:
-    print("Starting import smoke test...")
-
     from config.settings import (
         PROJECT_ROOT,
         DATA_DIR,
-        RAW_DIR,
-        PROCESSED_DIR,
-        OUTPUT_DIR,
         START_YEAR,
         END_YEAR,
-        OBSERVATION_WINDOW_DAYS,
-        CONFIDENCE_THRESHOLD,
-        ALPHA,
         TOP_N_PARTS,
     )
 
@@ -40,17 +29,12 @@ def test_import_smoke() -> None:
     from config.scrape_config import ScrapeConfig
     from config.config_builder import build_scrape_config
 
-    print("All imports passed.")
-
-    assert START_YEAR <= END_YEAR, "START_YEAR must be <= END_YEAR"
-    assert isinstance(PART_TAXONOMY, dict), "PART_TAXONOMY must be a dict"
-    assert isinstance(CATEGORY_PRIORITY, list), "CATEGORY_PRIORITY must be a list"
-    assert isinstance(SUPPORTED_VEHICLES, list), "SUPPORTED_VEHICLES must be a list"
-    assert ScrapeConfig is not None, "ScrapeConfig import failed"
-    assert callable(build_scrape_config), "build_scrape_config must be callable"
-
-    print("Basic validation passed.")
-    print("Import smoke test completed successfully.")
+    assert START_YEAR <= END_YEAR
+    assert isinstance(PART_TAXONOMY, dict)
+    assert isinstance(CATEGORY_PRIORITY, list)
+    assert isinstance(SUPPORTED_VEHICLES, list)
+    assert ScrapeConfig is not None
+    assert callable(build_scrape_config)
 
 
 if __name__ == "__main__":

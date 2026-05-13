@@ -9,80 +9,15 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from analysis.aggregation import build_analysis_summary
-from analysis.hypothesis_test import run_hypothesis_test
 from analysis.ranking import build_ranked_outputs, save_ranked_outputs
 from config.schema import ANALYSIS_EXPORT_RENAME_MAP, ANALYSIS_OUTPUT_COLUMNS
 
-
-# =========================================================
-# Hypothesis execution
-# =========================================================
-def run_hypothesis_from_summary(config):
-    """
-    Run hypothesis testing from an existing analysis summary CSV.
-
-    Purpose:
-    Reuse the saved analysis summary output instead of rebuilding the
-    full scrape/cleanse/normalize path every time we want to test a
-    part-vs-part comparison.
-
-    Outputs:
-    - hypothesis result CSV (single-row summary)
-    - paired comparison CSV (one row per matched vehicle)
-    """
-    logger = logging.getLogger(__name__)
-
-    source_path = config.source_analysis_summary_csv_path 
-
-    if not source_path.exists():
-        raise FileNotFoundError(
-            f"Analysis summary CSV not found: {source_path}"
-        )
-
-    result, paired_df = run_hypothesis_test(
-        csv_path=source_path,
-        part_a=config.hypothesis_part_a,
-        part_b=config.hypothesis_part_b,
-        metric=config.hypothesis_metric,
-        alpha=config.hypothesis_alpha,
-        alternative=config.hypothesis_alternative,
-        make=config.hypothesis_make,
-        model=config.hypothesis_model,
-        year_min=config.hypothesis_year_min,
-        year_max=config.hypothesis_year_max,
-        ci_confidence_level=config.hypothesis_ci_confidence_level,
-        ci_bootstrap_iterations=config.hypothesis_ci_bootstrap_iterations,
-        random_seed=config.hypothesis_random_seed,
-    )
-
-    config.hypothesis_output_csv_path.parent.mkdir(parents=True, exist_ok=True)
-    config.hypothesis_pairs_csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-    pd.DataFrame([asdict(result)]).to_csv(
-        config.hypothesis_output_csv_path,
-        index=False,
-    )
-
-    paired_df.to_csv(
-        config.hypothesis_pairs_csv_path,
-        index=False,
-    )
-
-    logger.info(
-        "Hypothesis outputs written | result_path=%s | pairs_path=%s | n_pairs=%s",
-        config.hypothesis_output_csv_path,
-        config.hypothesis_pairs_csv_path,
-        result.n_pairs,
-    )
-
-    return result, paired_df
 
 # =========================================================
 # Run analysis stage

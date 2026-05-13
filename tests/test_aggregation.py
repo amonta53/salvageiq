@@ -246,18 +246,18 @@ def test_build_active_summary_preserves_active_snapshot_rows() -> None:
         [
             {
                 "search_year": 2018,
-                "search_make_std": "toyota",
-                "search_model_std": "camry",
-                "search_part_std": "alternator",
-                "active_listing_count": 3,
+                "search_make": "toyota",
+                "search_model": "camry",
+                "search_part": "alternator",
+                "active_count": 3,
                 "scrape_ts": "2026-04-10 10:00:00",
             },
             {
                 "search_year": 2018,
-                "search_make_std": "toyota",
-                "search_model_std": "camry",
-                "search_part_std": "alternator",
-                "active_listing_count": 5,
+                "search_make": "toyota",
+                "search_model": "camry",
+                "search_part": "alternator",
+                "active_count": 5,
                 "scrape_ts": "2026-04-11 10:00:00",
             },
         ]

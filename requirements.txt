@@ -1,6 +1,4 @@
 pandas
-scipy
 httpx
 beautifulsoup4
 lxml
-matplotlib

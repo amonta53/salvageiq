@@ -60,34 +60,6 @@ def clean_price(value: str | None) -> float | None:
 
 
 
-def extract_first_text(row, selectors: list[str]) -> str | None:
-    """Return the first non-empty text match from the provided selectors."""
-    for selector in selectors:
-        try:
-            locator = row.locator(selector).first
-            if locator.count() > 0:
-                text = clean_text(locator.inner_text())
-                if text:
-                    return text
-        except Exception:
-            continue
-    return None
-
-
-
-def extract_first_attr(row, selectors: list[str], attr_name: str) -> str | None:
-    """Return the first non-empty attribute value from the provided selectors."""
-    for selector in selectors:
-        try:
-            locator = row.locator(selector).first
-            if locator.count() > 0:
-                value = clean_text(locator.get_attribute(attr_name))
-                if value:
-                    return value
-        except Exception:
-            continue
-    return None
-
 
 # =========================================================
 # Domain guess helpers
@@ -224,16 +196,3 @@ def looks_like_junk_title(title: str | None) -> bool:
     return any(marker in lowered for marker in JUNK_TITLE_MARKERS)
 
 
-def extract_result_count(page) -> int | None:
-    """Extract total result count from eBay search results page."""
-    try:
-        text = page.locator("h1.srp-controls__count-heading").inner_text()
-        # Example: "1,234 results for ..."
-        
-        match = re.search(r"([\d,]+)", text)
-        if match:
-            return int(match.group(1).replace(",", ""))
-    except Exception:
-        return None
-
-    return None

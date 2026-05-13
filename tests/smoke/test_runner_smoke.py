@@ -40,14 +40,8 @@ def test_runner_smoke() -> None:
     config.raw_csv_path = tmp_path / "raw_test.csv"
     config.log_path = tmp_path / "runner_test.log"
     config.checkpoint_path = tmp_path / "checkpoint_test.txt"
-    config.debug_dir = tmp_path / "debug"
 
-    # -------------------------------------------------
-    # Keep the test fast and low-risk
-    # -------------------------------------------------
     config.enable_resume = False
-    config.save_debug_html = False
-    config.headless = True
 
     result = run_scrape(config)
 

@@ -1,12 +1,11 @@
 # =========================================================
 # main.py
-# Entry point for the SalvageIQ pipeline
+# CLI entry point for the SalvageIQ pipeline.
 #
-# Purpose:
-# Keep startup simple:
-# - choose mode
-# - build config
-# - hand control to the orchestrator
+# Usage:
+#   python main.py          # full run
+#   python main.py mini     # quick pipeline check (1 vehicle, 2 parts, 2 years)
+#   python main.py test     # smoke test (1 vehicle, 1 part, 1 year)
 # =========================================================
 
 from __future__ import annotations
@@ -20,10 +19,9 @@ from pipeline.orchestrator import run_pipeline
 
 if __name__ == "__main__":
     selected_mode = sys.argv[1] if len(sys.argv) > 1 else "full"
-    input_run_id = sys.argv[2] if len(sys.argv) > 2 else None
 
     try:
-        config = build_scrape_config(mode=selected_mode, input_run_id=input_run_id)
+        config = build_scrape_config(mode=selected_mode)
         run_pipeline(config)
     except Exception:
         logging.exception("Pipeline failed")

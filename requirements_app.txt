@@ -3,7 +3,5 @@ uvicorn[standard]
 requests
 httpx
 pandas
-scipy
 beautifulsoup4
 lxml
-matplotlib
