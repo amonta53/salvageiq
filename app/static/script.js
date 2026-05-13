@@ -343,11 +343,24 @@ function clearOutput() {
 
 function renderVehicle(v) {
   if (!v) return;
+
+  const chips = [v.body_class, v.drive_type, v.engine, v.fuel_type]
+    .filter(Boolean)
+    .map(c => `<span class="vehicle-chip">${escapeHtml(c)}</span>`)
+    .join("");
+
+  const trimLine = v.trim || v.series
+    ? `<span class="text-secondary ms-1">${escapeHtml([v.trim, v.series].filter(Boolean).join(" · "))}</span>`
+    : "";
+
   summary.innerHTML = `
     <div class="alert alert-secondary rounded-4 mb-3">
-      <strong>${escapeHtml(v.year)} ${escapeHtml(v.make)} ${escapeHtml(v.model)}</strong>
-      ${v.trim ? `<span class="text-secondary ms-1">${escapeHtml(v.trim)}</span>` : ""}
-      ${v.source === "nhtsa_vpic" ? `<span class="badge bg-info ms-2">VIN decoded</span>` : ""}
+      <div class="d-flex flex-wrap align-items-center gap-2">
+        <strong>${escapeHtml(v.year)} ${escapeHtml(v.make)} ${escapeHtml(v.model)}</strong>
+        ${trimLine}
+        ${v.source === "nhtsa_vpic" ? `<span class="badge bg-info">VIN decoded</span>` : ""}
+      </div>
+      ${chips ? `<div class="mt-1 d-flex flex-wrap gap-1">${chips}</div>` : ""}
     </div>
   `;
 }

@@ -2,205 +2,461 @@
 # runner.py
 #
 # Purpose:
-#     Main Playwright scrape runner for SalvageIQ raw listing collection.
+#     Async httpx scrape runner for SalvageIQ raw listing collection.
+#     Replaces Playwright with concurrent HTTP requests + BeautifulSoup parsing.
 #
 # Responsibilities:
 #     1. Execute configured eBay searches across vehicle/part combinations
-#     2. Extract raw listing rows and append them to the raw CSV
+#        concurrently using asyncio.gather + a Semaphore
+#     2. Extract raw listing rows and write them to the raw CSV
 #     3. Capture run-level and search-level provenance fields
-#        including run_id, scrape_ts, and pass_type
-#     4. Support checkpoint/resume, browser restarts, and debug HTML capture
+#     4. Support checkpoint/resume
 #
 # Notes:
-#     - This runner favors scrape resilience over overly granular exception handling
-#     - Weak first-page results can short-circuit the remaining pages for a search
-#     - Static selectors live in config.extraction_rules
-#     - run_id is assigned once at pipeline start and passed in through config
+#     - eBay search result pages are server-side rendered — no JS execution needed
+#     - BeautifulSoup replaces Playwright DOM locators
+#     - All searches for a given pass (sold/all) run concurrently up to
+#       _MAX_CONCURRENCY simultaneous connections
+#     - run_scrape() is the sync entry point; it bridges to asyncio internally
 # =========================================================
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import asyncio
 import random
+import re
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from datetime import datetime, timezone
+from typing import Any
 
+import httpx
 import pandas as pd
-from playwright.sync_api import Browser, BrowserContext, Page, Playwright, sync_playwright
+from bs4 import BeautifulSoup
 
-from config.extraction_rules import (
-    LISTING_URL_SELECTORS,
-    PRICE_SELECTORS,
-    RESULT_ROW_SELECTORS,
-    SUBTITLE_SELECTORS,
-    TITLE_SELECTORS,
-)
+from config.extraction_rules import RESULT_ROW_SELECTORS
 from config.schema import MARKET_SUMMARY_COLUMNS, RAW_COLUMNS
 from config.scrape_config import ScrapeConfig
-from scrape.extractors import extract_first_attr, extract_first_text, looks_like_junk_title, extract_result_count
+from scrape.extractors import clean_text, looks_like_junk_title
 from scrape.search_builder import build_execution_key, build_search_key, build_search_url
 from utils.checkpoint_utils import append_completed_search, load_completed_searches
-from utils.io_utils import append_dataframe_to_csv, ensure_csv_with_headers, ensure_directory, save_text, append_row_to_csv
+from utils.io_utils import (
+    append_dataframe_to_csv,
+    append_row_to_csv,
+    ensure_csv_with_headers,
+    ensure_directory,
+)
 from utils.logging_utils import RunLogger, format_elapsed_hhmmss
 
 
 # =========================================================
-# Runtime state
+# Constants
+# =========================================================
+
+# Concurrent requests cap — fast enough to matter, polite enough not to trigger blocks
+_MAX_CONCURRENCY = 8
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/133.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+# =========================================================
+# Runtime stats
 # =========================================================
 
 @dataclass(slots=True)
 class ScrapeStats:
-    """
-    Track basic runtime stats for a scrape run.
-
-    These counters are operational only. They help monitor scrape progress,
-    page volume, and row collection during the current pipeline execution.
-    """
+    """Track basic runtime totals for a scrape run."""
     run_start: float
     total_rows: int = 0
     total_searches_run: int = 0
     total_pages_loaded: int = 0
-    next_progress_report: int = 50
 
 
 # =========================================================
-# Sleep and page helpers
+# BeautifulSoup extraction helpers
 # =========================================================
 
-def rand_sleep(min_s: float, max_s: float) -> None:
-    """Sleep for a random interval within the provided range."""
-    time.sleep(random.uniform(min_s, max_s))
+def _bs_first_text(tag: Any, selectors: list[str]) -> str | None:
+    """
+    Return the first non-empty text match from a list of CSS selectors.
+
+    Handles Playwright-style :has-text() pseudo-selectors by converting them
+    to a manual find_all scan, since BS4 does not support that pseudo-class.
+    """
+    for sel in selectors:
+        if ":has-text(" in sel:
+            # e.g. 'span:has-text("$")' — find any matching tag whose text contains the value
+            m = re.match(r'^(\w+)?:has-text\("([^"]+)"\)$', sel)
+            if m:
+                tag_name = m.group(1) or True
+                search_text = m.group(2)
+                for el in tag.find_all(tag_name):
+                    t = clean_text(el.get_text())
+                    if t and search_text in t:
+                        return t
+            continue
+
+        try:
+            el = tag.select_one(sel)
+            if el:
+                t = clean_text(el.get_text())
+                if t:
+                    return t
+        except Exception:
+            continue
+
+    return None
 
 
-def save_debug_html(page: Page, filepath: Path) -> None:
-    """Persist the current page HTML for scrape debugging."""
-    save_text(filepath, page.content())
+def _bs_first_attr(tag: Any, selectors: list[str], attr: str) -> str | None:
+    """Return the first non-empty attribute value from a list of CSS selectors."""
+    for sel in selectors:
+        if ":has-text(" in sel:
+            continue  # attribute extraction on :has-text is unsupported
+        try:
+            el = tag.select_one(sel)
+            if el and el.has_attr(attr):
+                val = clean_text(el[attr])
+                if val:
+                    return val
+        except Exception:
+            continue
+    return None
 
 
-def create_browser_session(playwright: Playwright, config: ScrapeConfig) -> tuple[Browser, BrowserContext, Page]:
-    """Create a new Playwright browser, context, and page."""
-    browser = playwright.chromium.launch(headless=config.headless)
-    context = browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/133.0.0.0 Safari/537.36"
-        ),
-        viewport={"width": 1440, "height": 900},
-        locale="en-US",
-    )
-    page = context.new_page()
-    return browser, context, page
+def _extract_result_count_bs(soup: BeautifulSoup) -> int | None:
+    """Extract total active-listing result count from an eBay search results page."""
+    try:
+        el = soup.select_one("h1.srp-controls__count-heading")
+        if el:
+            m = re.search(r"([\d,]+)", el.get_text())
+            if m:
+                return int(m.group(1).replace(",", ""))
+    except Exception:
+        pass
+    return None
 
 
-def close_browser_session(browser: Browser | None, context: BrowserContext | None) -> None:
-    """Close the active browser context and browser."""
-    if context is not None:
-        context.close()
-    if browser is not None:
-        browser.close()
-
-
-# =========================================================
-# Extraction
-# =========================================================
-
-def scrape_page_rows(
-    page: Page,
-    search_year: int,
-    search_make: str,
-    search_model: str,
-    search_part: str,
+def _extract_rows_from_page(
+    soup: BeautifulSoup,
+    year: int,
+    make: str,
+    model: str,
+    part: str,
     search_url: str,
     page_num: int,
     run_id: str,
     scrape_ts: str,
     pass_type: str,
-    logger: RunLogger,
-) -> list[dict[str, str | int | None]]:
+) -> list[dict[str, Any]]:
     """
-    Extract usable listing rows from the current search results page.
+    Extract usable listing rows from a parsed eBay search results page.
 
-    Metadata fields added to each row:
-    - run_id: identifies the full pipeline execution
-    - scrape_ts: timestamp for the current search snapshot
-    - pass_type: distinguishes sold vs all search passes
-
-    scrape_ts should be generated once per search execution, not once per row,
-    so all rows from the same search snapshot carry the same time marker.
+    Returns a list of row dicts whose keys match RAW_COLUMNS.
     """
-    rows = None
-    row_count = 0
-
-    # eBay layout shifts sometimes, so keep fallback row selectors.
-    for row_selector in RESULT_ROW_SELECTORS:
-        rows = page.locator(row_selector)
-        row_count = rows.count()
-        if row_count > 0:
+    # Try each row container selector in priority order
+    item_tags: list = []
+    for sel in RESULT_ROW_SELECTORS:
+        item_tags = soup.select(sel)
+        if item_tags:
             break
 
-    logger.log(f"  Rows found on page {page_num}: {row_count}")
+    extracted: list[dict[str, Any]] = []
 
-    extracted: list[dict[str, str | int | None]] = []
-
-    for row_index in range(row_count):
-        row = rows.nth(row_index)
-
-        try:
-            raw_text = row.inner_text()
-        except Exception:
-            raw_text = None
-
-        title = extract_first_text(row, TITLE_SELECTORS)
-        price_raw = extract_first_text(row, PRICE_SELECTORS)
-        listing_url = extract_first_attr(row, LISTING_URL_SELECTORS, "href")
-        subtitle = extract_first_text(row, SUBTITLE_SELECTORS)
+    for row in item_tags:
+        # --- Title ---
+        title = _bs_first_text(row, [
+            '[role="heading"]',
+            ".s-item__title",
+            "a span",
+            "a",
+            'div[role="heading"]',
+        ])
 
         if looks_like_junk_title(title):
             continue
 
+        # --- Price ---
+        price_raw = _bs_first_text(row, [".s-item__price"])
+        if not price_raw:
+            # Fallback: any short span/div containing "$"
+            for el in row.find_all(["span", "div"]):
+                t = clean_text(el.get_text())
+                if t and "$" in t and len(t) < 40:
+                    price_raw = t
+                    break
+
         if not title or not price_raw:
             continue
 
-        extracted.append(
-            {
-                "run_id": run_id,
-                "scrape_ts": scrape_ts,
-                "pass_type": pass_type,
-                "search_year": search_year,
-                "search_make": search_make,
-                "search_model": search_model,
-                "search_part": search_part,
-                "search_url": search_url,
-                "search_page": page_num,
-                "title": title,
-                "price_raw": price_raw,
-                "subtitle": subtitle,
-                "listing_url": listing_url,
-                "raw_text": raw_text,
-            }
-        )
+        # --- Subtitle ---
+        subtitle = _bs_first_text(row, [
+            ".s-item__subtitle",
+            ".SECONDARY_INFO",
+            ".s-item__dynamic",
+            ".s-item__details",
+            ".s-item__caption-section",
+        ])
+
+        # --- Listing URL ---
+        listing_url = _bs_first_attr(row, ["a"], "href")
+
+        # --- Raw text for downstream guess heuristics ---
+        raw_text = clean_text(row.get_text(separator=" "))
+
+        extracted.append({
+            "run_id": run_id,
+            "scrape_ts": scrape_ts,
+            "pass_type": pass_type,
+            "search_year": year,
+            "search_make": make,
+            "search_model": model,
+            "search_part": part,
+            "search_url": search_url,
+            "search_page": page_num,
+            "title": title,
+            "price_raw": price_raw,
+            "subtitle": subtitle,
+            "listing_url": listing_url,
+            "raw_text": raw_text,
+        })
 
     return extracted
 
 
 # =========================================================
-# Main scrape pipeline
+# Async fetch with retry
+# =========================================================
+
+async def _fetch(
+    client: httpx.AsyncClient,
+    url: str,
+    logger: RunLogger,
+    retries: int = 2,
+) -> str | None:
+    """GET a URL and return the response body. Retries on transient errors."""
+    for attempt in range(1, retries + 2):
+        try:
+            resp = await client.get(url, follow_redirects=True)
+            resp.raise_for_status()
+            return resp.text
+        except Exception as exc:
+            if attempt <= retries:
+                wait = random.uniform(1.0, 2.5) * attempt
+                logger.log(f"  Fetch error (attempt {attempt}): {exc} — retrying in {wait:.1f}s")
+                await asyncio.sleep(wait)
+            else:
+                logger.log(f"  Fetch failed after {retries + 1} attempts: {url} — {exc}")
+    return None
+
+
+# =========================================================
+# Single search coroutine
+# =========================================================
+
+async def _scrape_one_search(
+    sem: asyncio.Semaphore,
+    client: httpx.AsyncClient,
+    year: int,
+    make: str,
+    model: str,
+    part: str,
+    config: ScrapeConfig,
+    logger: RunLogger,
+) -> tuple[list[dict], dict | None, int]:
+    """
+    Scrape all pages for a single year/make/model/part search.
+
+    Returns (rows, summary_row, pages_loaded) where:
+    - rows is populated for 'sold' pass and empty for 'all' pass
+    - summary_row is populated for 'all' pass and None for 'sold' pass
+    - pages_loaded is the number of pages successfully fetched
+    """
+    async with sem:
+        scrape_ts = datetime.now(timezone.utc).isoformat()
+        rows: list[dict] = []
+        summary: dict | None = None
+        pages_loaded = 0
+
+        search_key = build_search_key(year, make, model, part)
+        execution_key = build_execution_key(year, make, model, part, config.search_scope)
+
+        logger.log(f"  [{config.search_scope.upper()}] {year} {make} {model} | {part}")
+
+        for page_num in range(1, config.max_pages_per_search + 1):
+            url = build_search_url(year, make, model, part, config, page_num)
+
+            # Small random jitter to spread out concurrent request timing
+            await asyncio.sleep(random.uniform(0.05, 0.3))
+
+            html = await _fetch(client, url, logger)
+            if not html:
+                break
+
+            pages_loaded += 1
+            soup = BeautifulSoup(html, "lxml")
+
+            # ---- 'all' pass: grab result count and stop ----
+            if config.search_scope == "all":
+                result_count = _extract_result_count_bs(soup)
+                summary = {
+                    "run_id": config.run_id,
+                    "scrape_ts": scrape_ts,
+                    "pass_type": config.search_scope,
+                    "search_key": search_key,
+                    "execution_key": execution_key,
+                    "search_scope": config.search_scope,
+                    "search_year": year,
+                    "search_make": make,
+                    "search_model": model,
+                    "search_part": part,
+                    "search_url": url,
+                    "result_count": result_count,
+                    "page_count_observed": None,
+                }
+                logger.log(f"    Market summary: result_count={result_count}")
+                break
+
+            # ---- 'sold' pass: extract listing rows ----
+            page_rows = _extract_rows_from_page(
+                soup=soup,
+                year=year,
+                make=make,
+                model=model,
+                part=part,
+                search_url=url,
+                page_num=page_num,
+                run_id=config.run_id,
+                scrape_ts=scrape_ts,
+                pass_type=config.search_scope,
+            )
+
+            logger.log(f"    Page {page_num}: {len(page_rows)} rows")
+            rows.extend(page_rows)
+
+            # Weak first-page guard: skip further pages when results are sparse
+            if page_num == 1 and len(page_rows) < config.weak_result_skip_threshold:
+                logger.log(
+                    f"    Weak first page ({len(page_rows)} rows) — skipping remaining pages."
+                )
+                break
+
+        return rows, summary, pages_loaded
+
+
+# =========================================================
+# Async orchestration
+# =========================================================
+
+async def _run_scrape_async(
+    config: ScrapeConfig,
+    logger: RunLogger,
+) -> dict[str, int]:
+    """
+    Core async implementation: build all search tasks, run them concurrently,
+    collect results, and flush to CSV.
+    """
+    completed_searches = (
+        load_completed_searches(config.checkpoint_path) if config.enable_resume else set()
+    )
+
+    # Build the full list of (year, make, model, part) tuples to search
+    tasks: list[tuple[int, str, str, str]] = []
+    for make, models in config.make_model_map.items():
+        for model in models:
+            for year in range(config.start_year, config.end_year + 1):
+                for part in config.parts:
+                    execution_key = build_execution_key(
+                        year, make, model, part, config.search_scope
+                    )
+                    if config.enable_resume and execution_key in completed_searches:
+                        continue
+                    tasks.append((year, make, model, part))
+
+    logger.log(f"Search tasks: {len(tasks)} (scope={config.search_scope})")
+
+    sem = asyncio.Semaphore(_MAX_CONCURRENCY)
+
+    async with httpx.AsyncClient(headers=_HEADERS, timeout=30.0) as client:
+        coroutines = [
+            _scrape_one_search(sem, client, year, make, model, part, config, logger)
+            for year, make, model, part in tasks
+        ]
+        results = await asyncio.gather(*coroutines, return_exceptions=True)
+
+    # Collect results and write to CSV
+    all_rows: list[dict] = []
+    all_summaries: list[dict] = []
+    total_pages = 0
+
+    for i, result in enumerate(results):
+        year, make, model, part = tasks[i]
+
+        if isinstance(result, Exception):
+            logger.log(f"  Exception for {year} {make} {model} | {part}: {result}")
+            continue
+
+        rows, summary, pages = result
+        all_rows.extend(rows)
+        total_pages += pages
+
+        if summary:
+            all_summaries.append(summary)
+
+        # Checkpoint each completed search
+        if config.enable_resume:
+            execution_key = build_execution_key(
+                year, make, model, part, config.search_scope
+            )
+            append_completed_search(config.checkpoint_path, execution_key)
+
+    # Write raw listing rows in one batch
+    if all_rows:
+        df = pd.DataFrame(all_rows).reindex(columns=RAW_COLUMNS)
+        append_dataframe_to_csv(df, config.raw_csv_path)
+
+    # Write market summary rows individually (small count, preserves column order)
+    for summary in all_summaries:
+        append_row_to_csv(config.market_summary_csv_path, summary, MARKET_SUMMARY_COLUMNS)
+
+    return {
+        "total_rows": len(all_rows),
+        "total_searches_run": len(tasks),
+        "total_pages_loaded": total_pages,
+    }
+
+
+# =========================================================
+# Public entry point (sync, for orchestrator compatibility)
 # =========================================================
 
 def run_scrape(config: ScrapeConfig) -> dict[str, int]:
     """
     Run the raw scrape stage and return basic scrape totals.
 
+    This is the sync entry point called by the pipeline orchestrator.
+    It bridges to the async implementation via asyncio.run().
+
     Flow:
     1. Prepare output folders and CSV headers
     2. Resume prior work if checkpointing is enabled
-    3. Iterate configured vehicle/part search combinations
-    4. Capture one scrape timestamp per search execution
-    5. Write either market summary rows or raw listing rows
-    6. Persist completed searches for resume support
+    3. Run all part searches concurrently with bounded parallelism
+    4. Write collected rows to raw CSV and market summary CSV
+    5. Return totals dict for the orchestrator to log
     """
+    run_start = time.time()
+
     ensure_directory(config.run_dir)
     if config.save_debug_html:
         ensure_directory(config.debug_dir)
@@ -209,206 +465,26 @@ def run_scrape(config: ScrapeConfig) -> dict[str, int]:
     ensure_csv_with_headers(config.market_summary_csv_path, MARKET_SUMMARY_COLUMNS)
 
     logger = RunLogger(config.scrape_log_path)
-    completed_searches = load_completed_searches(config.checkpoint_path) if config.enable_resume else set()
-
-    stats = ScrapeStats(
-        run_start=time.time(),
-        next_progress_report=config.progress_report_interval,
-    )
-
-    total_models = sum(len(models) for models in config.make_model_map.values())
-    total_years = config.end_year - config.start_year + 1
-    total_parts = len(config.parts)
-    total_searches = total_models * total_years * total_parts
-    search_counter = 0
 
     logger.log("=" * 72)
-    logger.log("STARTING SCRAPE RUN")
-    logger.log(f"Run ID: {config.run_id}")
-    logger.log(f"Search scope: {config.search_scope}")
-    logger.log(f"Raw CSV path: {config.raw_csv_path}")
-    logger.log(f"Log path: {config.log_path}")
-    logger.log(f"Checkpoint path: {config.checkpoint_path}")
-    logger.log(f"Total potential searches: {total_searches}")
-    logger.log(f"Headless mode: {config.headless}")
+    logger.log("STARTING SCRAPE RUN  [async httpx]")
+    logger.log(f"Run ID:   {config.run_id}")
+    logger.log(f"Scope:    {config.search_scope}")
+    logger.log(f"Raw CSV:  {config.raw_csv_path}")
+    logger.log(f"Log:      {config.scrape_log_path}")
     logger.log("=" * 72)
 
-    with sync_playwright() as playwright:
-        browser, context, page = create_browser_session(playwright, config)
+    totals = asyncio.run(_run_scrape_async(config, logger))
 
-        try:
-            for make, models in config.make_model_map.items():
-                for model in models:
-                    for year in range(config.start_year, config.end_year + 1):
-                        for part in config.parts:
-                            search_key = build_search_key(year, make, model, part)
-
-                            execution_key = build_execution_key(
-                                year,
-                                make,
-                                model,
-                                part,
-                                config.search_scope,
-                            )
-
-                            if config.enable_resume and execution_key in completed_searches:
-                                continue
-
-                            search_counter += 1
-                            stats.total_searches_run += 1
-
-                            elapsed_seconds = time.time() - stats.run_start
-                            elapsed = format_elapsed_hhmmss(elapsed_seconds)
-                            progress_pct = (search_counter / total_searches) * 100 if total_searches else 0.0
-
-                            avg_seconds_per_search = (
-                                elapsed_seconds / search_counter if search_counter else 0.0
-                            )
-                            remaining_searches = total_searches - search_counter
-                            eta_seconds = remaining_searches * avg_seconds_per_search
-                            eta = format_elapsed_hhmmss(eta_seconds)
-
-                            logger.log(
-                                f"[SEARCH {search_counter}/{total_searches} | "
-                                f"{progress_pct:.1f}% | Elapsed {elapsed} | ETA {eta}] "
-                                f"{config.search_scope.upper()} | {year} {make} {model} {part}"
-                            )
-
-                            if stats.total_searches_run % config.browser_restart_interval == 0:
-                                logger.log(f"[BROWSER] Restarting browser session at search {stats.total_searches_run}")
-                                close_browser_session(browser, context)
-                                browser, context, page = create_browser_session(playwright, config)
-
-                            # Small pre-search stagger so we do not hammer requests back-to-back.
-                            rand_sleep(config.search_delay_min, config.search_delay_max)
-
-                            # Capture one timestamp for this search execution so all rows
-                            # from the same sold/all snapshot share the same scrape_ts.
-                            scrape_ts = datetime.now(timezone.utc).isoformat()
-
-                            first_page_row_count = 0
-
-                            for page_num in range(1, config.max_pages_per_search + 1):
-                                search_url = build_search_url(year, make, model, part, config, page_num)
-                                logger.log(f"  Loading page {page_num}: {search_url}")
-
-                                try:
-                                    page.goto(search_url, wait_until="domcontentloaded", timeout=config.goto_timeout_ms)
-
-                                    if config.search_scope == "all":
-                                        result_count = extract_result_count(page)
-
-                                        summary_row = {
-                                            "run_id": config.run_id,
-                                            "scrape_ts": scrape_ts,
-                                            "pass_type": config.search_scope,
-                                            "search_key": search_key,
-                                            "execution_key": execution_key,
-                                            "search_scope": config.search_scope,
-                                            "search_year": year,
-                                            "search_make": make,
-                                            "search_model": model,
-                                            "search_part": part,
-                                            "search_url": search_url,
-                                            "result_count": result_count,
-                                            "page_count_observed": None,
-                                        }
-
-                                        append_row_to_csv(
-                                            config.market_summary_csv_path,
-                                            summary_row,
-                                            MARKET_SUMMARY_COLUMNS,
-                                        )
-
-                                        logger.log(f"  Market summary saved. Result count: {result_count}")
-                                        break
-
-                                    stats.total_pages_loaded += 1
-                                    rand_sleep(config.page_delay_min, config.page_delay_max)
-
-                                    page_rows = scrape_page_rows(
-                                        page=page,
-                                        search_year=year,
-                                        search_make=make,
-                                        search_model=model,
-                                        search_part=part,
-                                        search_url=search_url,
-                                        page_num=page_num,
-                                        run_id=config.run_id,
-                                        scrape_ts=scrape_ts,
-                                        pass_type=config.search_scope,
-                                        logger=logger,
-                                    )
-
-                                    if page_num == 1:
-                                        first_page_row_count = len(page_rows)
-
-                                    if page_rows:
-                                        page_df = pd.DataFrame(page_rows)
-                                        append_dataframe_to_csv(page_df, config.raw_csv_path)
-                                        stats.total_rows += len(page_rows)
-                                        logger.log(f"  Saved {len(page_rows)} rows from page {page_num}.")
-
-                                        while stats.total_rows >= stats.next_progress_report:
-                                            rows_elapsed = format_elapsed_hhmmss(time.time() - stats.run_start)
-                                            logger.log(
-                                                f"[ROWS] {stats.total_rows} rows collected | "
-                                                f"Elapsed {rows_elapsed} | Pages loaded {stats.total_pages_loaded}"
-                                            )
-                                            stats.next_progress_report += config.progress_report_interval
-                                    else:
-                                        logger.log("  No usable rows found on this page.")
-                                        if config.save_debug_html:
-                                            debug_file = config.build_error_html_path(
-                                                year=year,
-                                                make=make,
-                                                model=model,
-                                                part=part,
-                                                page_num=page_num,
-                                            )
-                                            save_debug_html(page, debug_file)
-                                            logger.log(f"  Debug HTML saved: {debug_file.name}")
-
-                                except Exception as exc:
-                                    logger.log(f"  ERROR on {search_url}: {exc}")
-                                    if config.save_debug_html:
-                                        debug_file = config.build_error_html_path(
-                                            year=year,
-                                            make=make,
-                                            model=model,
-                                            part=part,
-                                            page_num=page_num,
-                                        )
-                                        save_debug_html(page, debug_file)
-                                        logger.log(f"  Error HTML saved: {debug_file.name}")
-
-                                if page_num == 1 and first_page_row_count < config.weak_result_skip_threshold:
-                                    logger.log(
-                                        f"  Weak first page result ({first_page_row_count} rows) - "
-                                        f"skipping remaining pages for this search."
-                                    )
-                                    break
-      
-                                if page_num < config.max_pages_per_search:
-                                    rand_sleep(config.next_page_delay_min, config.next_page_delay_max)
-
-                            if config.enable_resume:
-                                append_completed_search(config.checkpoint_path, execution_key)
-                                completed_searches.add(execution_key)
-
-        finally:
-            close_browser_session(browser, context)
-
-    elapsed = format_elapsed_hhmmss(time.time() - stats.run_start)
+    elapsed = format_elapsed_hhmmss(time.time() - run_start)
     logger.log("=" * 72)
     logger.log(
-        f"SCRAPE COMPLETE | Run ID={config.run_id} | Rows={stats.total_rows} | "
-        f"Searches run={stats.total_searches_run} | Elapsed={elapsed}"
+        f"SCRAPE COMPLETE | Run ID={config.run_id} | "
+        f"Rows={totals['total_rows']} | "
+        f"Searches={totals['total_searches_run']} | "
+        f"Pages={totals['total_pages_loaded']} | "
+        f"Elapsed={elapsed}"
     )
     logger.log("=" * 72)
 
-    return {
-        "total_rows": stats.total_rows,
-        "total_searches_run": stats.total_searches_run,
-        "total_pages_loaded": stats.total_pages_loaded,
-    }
+    return totals

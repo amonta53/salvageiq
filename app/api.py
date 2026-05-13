@@ -95,6 +95,11 @@ def search(payload: SearchRequest, background_tasks: BackgroundTasks) -> dict:
             make=vehicle.make,
             model=vehicle.model,
             trim=vehicle.trim,
+            series=vehicle.series,
+            body_class=vehicle.body_class,
+            drive_type=vehicle.drive_type,
+            engine=vehicle.engine,
+            fuel_type=vehicle.fuel_type,
         )
 
     cache = check_cache(vehicle_key, payload.window_days)

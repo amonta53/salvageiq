@@ -27,6 +27,11 @@ class VehicleIdentity:
     make: str
     model: str
     trim: str | None = None
+    series: str | None = None
+    body_class: str | None = None
+    drive_type: str | None = None
+    engine: str | None = None
+    fuel_type: str | None = None
     source: str = "direct"
 
     def to_dict(self) -> dict[str, Any]:
@@ -61,7 +66,6 @@ def normalize_vehicle_input(
         year=int(year),
         make=make.strip(),
         model=model.strip(),
-        trim=None,
         source="direct",
     )
 
@@ -72,8 +76,7 @@ def build_vehicle_key(vehicle: VehicleIdentity) -> str:
 
     Trim is intentionally excluded: the scraping pipeline does not
     differentiate by trim, and NHTSA decode can return inconsistent
-    or absent trim values for the same VIN across calls — including
-    the key would cause perpetual cache misses.
+    or absent trim values for the same VIN across calls.
 
     Example: 2017|chrysler|pacifica
     """
@@ -88,18 +91,27 @@ def decode_vin_with_nhtsa(vin: str) -> VehicleIdentity:
     """
     Decode a VIN using the NHTSA vPIC API.
 
-    NHTSA is good enough for the first working model. It avoids storing API
-    credentials in client-side code, which is where dreams and secrets go to die.
+    Captures year/make/model/trim plus body class, drive type,
+    engine, and fuel type for richer display and future fitment work.
     """
     url = f"https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVin/{vin}?format=json"
     response = requests.get(url, timeout=20)
     response.raise_for_status()
 
+    _WANTED = {
+        "Model Year", "Make", "Model", "Trim", "Series",
+        "Body Class", "Drive Type",
+        "Engine Configuration", "Engine Number of Cylinders",
+        "Displacement (L)",
+        "Fuel Type - Primary",
+    }
+
     results = response.json().get("Results", [])
     values = {
         row.get("Variable"): row.get("Value")
         for row in results
-        if row.get("Variable") in {"Model Year", "Make", "Model", "Trim"}
+        if row.get("Variable") in _WANTED
+        and row.get("Value") not in (None, "", "Not Applicable")
     }
 
     if not values.get("Model Year") or not values.get("Make") or not values.get("Model"):
@@ -109,6 +121,120 @@ def decode_vin_with_nhtsa(vin: str) -> VehicleIdentity:
         year=int(values["Model Year"]),
         make=values["Make"].strip(),
         model=values["Model"].strip(),
-        trim=(values.get("Trim") or None),
+        trim=values.get("Trim") or None,
+        series=values.get("Series") or None,
+        body_class=_normalize_body_class(values.get("Body Class")),
+        drive_type=_normalize_drive_type(values.get("Drive Type")),
+        engine=_compose_engine(
+            values.get("Displacement (L)"),
+            values.get("Engine Configuration"),
+            values.get("Engine Number of Cylinders"),
+        ),
+        fuel_type=_normalize_fuel_type(values.get("Fuel Type - Primary")),
         source="nhtsa_vpic",
     )
+
+
+# =========================================================
+# Field normalizers
+# =========================================================
+
+def _compose_engine(
+    displacement: str | None,
+    config: str | None,
+    cylinders: str | None,
+) -> str | None:
+    """Build a short readable engine string, e.g. '3.6L V6' or '2.0L I4'."""
+    parts: list[str] = []
+
+    if displacement:
+        try:
+            parts.append(f"{float(displacement):.1f}L")
+        except ValueError:
+            parts.append(displacement)
+
+    if config and cylinders:
+        c = cylinders.strip()
+        cfg = config.upper()
+        if "V" in cfg and "SHAPED" in cfg:
+            parts.append(f"V{c}")
+        elif "IN-LINE" in cfg or "STRAIGHT" in cfg:
+            parts.append(f"I{c}")
+        elif "FLAT" in cfg or "BOXER" in cfg or "OPPOSED" in cfg:
+            parts.append(f"H{c}")
+        elif "ROTARY" in cfg or "WANKEL" in cfg:
+            parts.append("Rotary")
+        else:
+            parts.append(f"{c}-cyl")
+    elif cylinders:
+        parts.append(f"{cylinders.strip()}-cyl")
+
+    return " ".join(parts) if parts else None
+
+
+def _normalize_drive_type(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    s = raw.upper()
+    if "AWD" in s or "ALL-WHEEL" in s or "ALL WHEEL" in s:
+        return "AWD"
+    if "4WD" in s or "4X4" in s or "4-WHEEL" in s or "FOUR-WHEEL" in s:
+        return "4WD"
+    if "FWD" in s or "FRONT" in s:
+        return "FWD"
+    if "RWD" in s or "REAR" in s:
+        return "RWD"
+    return raw.strip()
+
+
+def _normalize_body_class(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    s = raw.strip()
+    # Map verbose NHTSA strings to short readable labels
+    lower = s.lower()
+    if "sport utility" in lower:
+        return "SUV"
+    if "pickup" in lower:
+        return "Pickup"
+    if "minivan" in lower or "van/minivan" in lower:
+        return "Minivan"
+    if "cargo van" in lower:
+        return "Cargo Van"
+    if "convertible" in lower:
+        return "Convertible"
+    if "coupe" in lower:
+        return "Coupe"
+    if "hatchback" in lower:
+        return "Hatchback"
+    if "wagon" in lower:
+        return "Wagon"
+    if "sedan" in lower:
+        return "Sedan"
+    if "crossover" in lower:
+        return "Crossover"
+    # Strip any trailing parenthetical (e.g. "(SUV)") for anything else
+    import re
+    return re.sub(r"\s*\([^)]+\)\s*$", "", s).strip() or None
+
+
+def _normalize_fuel_type(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    s = raw.strip()
+    lower = s.lower()
+    if "gasoline" in lower or "petrol" in lower:
+        return "Gas"
+    if "diesel" in lower:
+        return "Diesel"
+    if "electric" in lower and "hybrid" not in lower:
+        return "Electric"
+    if "hybrid" in lower and "plug" in lower:
+        return "Plug-in Hybrid"
+    if "hybrid" in lower:
+        return "Hybrid"
+    if "natural gas" in lower or "cng" in lower:
+        return "CNG"
+    if "flex" in lower or "e85" in lower or "ethanol" in lower:
+        return "Flex Fuel"
+    return s

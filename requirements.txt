@@ -1,4 +1,6 @@
 pandas
 scipy
-playwright
+httpx
+beautifulsoup4
+lxml
 matplotlib

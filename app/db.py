@@ -138,6 +138,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("result_items", "estimated_pull_minutes", "INTEGER"),
         ("result_items", "difficulty_score",        "INTEGER"),
         ("result_items", "shipping_class",          "TEXT"),
+        ("vehicles",     "series",                  "TEXT"),
+        ("vehicles",     "fuel_type",               "TEXT"),
     ]
     for table, column, col_type in new_columns:
         try:
@@ -213,17 +215,29 @@ def upsert_vehicle(
     make: str,
     model: str,
     trim: str | None = None,
-    engine: str | None = None,
+    series: str | None = None,
     body_class: str | None = None,
     drive_type: str | None = None,
+    engine: str | None = None,
+    fuel_type: str | None = None,
 ) -> None:
     conn.execute(
         """
-        INSERT INTO vehicles (vehicle_key, year, make, model, trim, engine, body_class, drive_type, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(vehicle_key) DO NOTHING
+        INSERT INTO vehicles (
+            vehicle_key, year, make, model, trim, series,
+            body_class, drive_type, engine, fuel_type, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(vehicle_key) DO UPDATE SET
+            trim       = COALESCE(excluded.trim,       vehicles.trim),
+            series     = COALESCE(excluded.series,     vehicles.series),
+            body_class = COALESCE(excluded.body_class, vehicles.body_class),
+            drive_type = COALESCE(excluded.drive_type, vehicles.drive_type),
+            engine     = COALESCE(excluded.engine,     vehicles.engine),
+            fuel_type  = COALESCE(excluded.fuel_type,  vehicles.fuel_type)
         """,
-        (vehicle_key, year, make, model, trim, engine, body_class, drive_type, _now()),
+        (vehicle_key, year, make, model, trim, series,
+         body_class, drive_type, engine, fuel_type, _now()),
     )
 
 

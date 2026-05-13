@@ -1,7 +1,9 @@
 fastapi
 uvicorn[standard]
 requests
+httpx
 pandas
 scipy
-playwright
+beautifulsoup4
+lxml
 matplotlib
