@@ -117,16 +117,15 @@ async def _fetch_sold(
     Returns a list of row dicts matching RAW_COLUMNS.
     """
     params = {
-        "OPERATION-NAME":          "findCompletedItems",
-        "SERVICE-VERSION":         _API_SERVICE_VER,
-        "SECURITY-APPNAME":        app_id,
-        "RESPONSE-DATA-FORMAT":    "JSON",
-        "keywords":                _keywords(year, make, model, part),
-        "categoryId":              _MOTORS_PARTS_CAT,
-        "itemFilter(0).name":      "SoldItemsOnly",
-        "itemFilter(0).value":     "true",
+        "OPERATION-NAME":                 "findCompletedItems",
+        "SERVICE-VERSION":                _API_SERVICE_VER,
+        "SECURITY-APPNAME":               app_id,
+        "RESPONSE-DATA-FORMAT":           "JSON",
+        "keywords":                       _keywords(year, make, model, part),
+        "itemFilter(0).name":             "SoldItemsOnly",
+        "itemFilter(0).value":            "true",
         "paginationInput.entriesPerPage": "100",
-        "sortOrder":               "EndTimeSoonest",
+        "sortOrder":                      "EndTimeSoonest",
     }
 
     scrape_ts = datetime.now(timezone.utc).isoformat()
@@ -142,11 +141,18 @@ async def _fetch_sold(
         return rows
 
     try:
-        items = (
-            data["findCompletedItemsResponse"][0]
-                ["searchResult"][0]
-                .get("item", [])
-        )
+        resp = data["findCompletedItemsResponse"][0]
+        ack  = resp.get("ack", [""])[0]
+        if ack != "Success":
+            errs = resp.get("errorMessage", [{}])[0].get("error", [{}])[0]
+            logger.warning(
+                "findCompletedItems ack=%s | %s %s %s | %s | %s — %s",
+                ack, year, make, model, part,
+                errs.get("errorId", ["?"])[0],
+                errs.get("message", ["no message"])[0],
+            )
+            return rows
+        items = resp["searchResult"][0].get("item", [])
     except (KeyError, IndexError):
         return rows
 
@@ -198,12 +204,11 @@ async def _fetch_active(
     Returns a single row dict matching MARKET_SUMMARY_COLUMNS.
     """
     params = {
-        "OPERATION-NAME":          "findItemsAdvanced",
-        "SERVICE-VERSION":         _API_SERVICE_VER,
-        "SECURITY-APPNAME":        app_id,
-        "RESPONSE-DATA-FORMAT":    "JSON",
-        "keywords":                _keywords(year, make, model, part),
-        "categoryId":              _MOTORS_PARTS_CAT,
+        "OPERATION-NAME":                 "findItemsAdvanced",
+        "SERVICE-VERSION":                _API_SERVICE_VER,
+        "SECURITY-APPNAME":               app_id,
+        "RESPONSE-DATA-FORMAT":           "JSON",
+        "keywords":                       _keywords(year, make, model, part),
         "paginationInput.entriesPerPage": "1",   # only need the total count
     }
 
@@ -215,12 +220,19 @@ async def _fetch_active(
     try:
         r = await client.get(_build_url(params))
         r.raise_for_status()
-        data  = r.json()
-        total = int(
-            data["findItemsAdvancedResponse"][0]
-                ["paginationOutput"][0]
-                ["totalEntries"][0]
-        )
+        data = r.json()
+        resp = data["findItemsAdvancedResponse"][0]
+        ack  = resp.get("ack", [""])[0]
+        if ack != "Success":
+            errs = resp.get("errorMessage", [{}])[0].get("error", [{}])[0]
+            logger.warning(
+                "findItemsAdvanced ack=%s | %s %s %s | %s | %s — %s",
+                ack, year, make, model, part,
+                errs.get("errorId", ["?"])[0],
+                errs.get("message", ["no message"])[0],
+            )
+        else:
+            total = int(resp["paginationOutput"][0]["totalEntries"][0])
     except Exception as exc:
         logger.warning("findItemsAdvanced failed | %s %s %s | %s | %s", year, make, model, part, exc)
 
