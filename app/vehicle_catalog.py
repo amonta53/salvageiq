@@ -22,12 +22,14 @@ from app.db import get_catalog_cache, get_db, set_catalog_cache
 
 logger = logging.getLogger(__name__)
 
-NHTSA_BASE = "https://vpic.nhtsa.dot.gov/api/vehicles"
+NHTSA_BASE     = "https://vpic.nhtsa.dot.gov/api/vehicles"
+CARQUERY_BASE  = "https://www.carqueryapi.com/api/0.3"
 CACHE_TTL_DAYS = 30
 
 # In-process memory cache — survives for the lifetime of the worker
 _makes_cache: list[str] | None = None
 _models_cache: dict[str, list[str]] = {}
+_trims_cache:  dict[str, list[str]] = {}
 
 
 async def fetch_makes() -> list[str]:
@@ -108,3 +110,58 @@ async def fetch_models(make: str, year: int) -> list[str]:
 
     _models_cache[mem_key] = models
     return models
+
+
+async def fetch_trims(make: str, model: str, year: int) -> list[str]:
+    """
+    Return sorted trim/package levels for a given make+model+year.
+
+    Uses the CarQuery API (free, no key required), which holds trim-level
+    data for most passenger vehicles sold in the US.  Falls back to an
+    empty list gracefully — the UI keeps the trim field as a free-text
+    input so users can still type a trim manually.
+
+    Cache hierarchy:
+    1. In-process memory (instant)
+    2. SQLite (survives restarts, 30-day TTL)
+    3. CarQuery HTTP call (~200 ms, cached on return)
+    """
+    mem_key = f"{year}|{make.lower()}|{model.lower()}"
+    if mem_key in _trims_cache:
+        return _trims_cache[mem_key]
+
+    with get_db() as conn:
+        cached = get_catalog_cache(conn, cache_type="trims", make=make, model=model, year=year)
+    if cached is not None:
+        _trims_cache[mem_key] = cached
+        return cached
+
+    # CarQuery accepts lowercase make names as IDs
+    params = {
+        "cmd":         "getTrims",
+        "year":        str(year),
+        "make":        make.lower(),
+        "model":       model,
+        "sold_in_us":  "1",
+    }
+
+    trims: list[str] = []
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(CARQUERY_BASE, params=params)
+            r.raise_for_status()
+            data = r.json()
+
+        trims = sorted({
+            t["model_trim"]
+            for t in data.get("Trims", [])
+            if t.get("model_trim", "").strip()
+        })
+    except Exception as exc:
+        logger.warning("CarQuery trims failed | %s %s %s | %s", year, make, model, exc)
+
+    with get_db() as conn:
+        set_catalog_cache(conn, cache_type="trims", make=make, model=model, year=year, data=trims)
+
+    _trims_cache[mem_key] = trims
+    return trims

@@ -17,9 +17,11 @@ const historyList    = document.getElementById("historyList");
 // Vehicle cascading selects (NHTSA vPIC)
 // =========================================================
 
-const yearEl  = document.getElementById("year");
-const makeEl  = document.getElementById("make");
-const modelEl = document.getElementById("model");
+const yearEl     = document.getElementById("year");
+const makeEl     = document.getElementById("make");
+const modelEl    = document.getElementById("model");
+const trimEl     = document.getElementById("trim");
+const trimListEl = document.getElementById("trimOptions");
 
 // Populate year options
 (function populateYears() {
@@ -32,21 +34,27 @@ const modelEl = document.getElementById("model");
   }
 })();
 
-// Year change: enable model reset but makes are already loaded
+// Year change: reset model + trims but makes are already loaded
 yearEl.addEventListener("change", () => {
   _resetSelect(modelEl, "— select make —", true);
-  // If a make is already chosen, reload models for the new year
+  _clearTrims();
   if (makeEl.value && yearEl.value) loadModels(yearEl.value, makeEl.value);
 });
 
 makeEl.addEventListener("change", () => {
   _resetSelect(modelEl, "— select make —", true);
+  _clearTrims();
   if (makeEl.value && yearEl.value) loadModels(yearEl.value, makeEl.value);
 });
 
 function _resetSelect(el, placeholder, disabled) {
   el.innerHTML = `<option value="">${placeholder}</option>`;
   el.disabled  = disabled;
+}
+
+function _clearTrims() {
+  trimListEl.innerHTML = "";
+  trimEl.value = "";
 }
 
 async function loadMakes() {
@@ -66,6 +74,7 @@ async function loadMakes() {
 async function loadModels(year, make) {
   modelEl.innerHTML = '<option value="">Loading…</option>';
   modelEl.disabled  = true;
+  _clearTrims();
   try {
     const r    = await fetch(`/api/vehicles/models?make=${encodeURIComponent(make)}&year=${year}`);
     const data = await r.json();
@@ -78,15 +87,38 @@ async function loadModels(year, make) {
   }
 }
 
+modelEl.addEventListener("change", () => {
+  _clearTrims();
+  if (modelEl.value && makeEl.value && yearEl.value) {
+    loadTrims(yearEl.value, makeEl.value, modelEl.value);
+  }
+});
+
+async function loadTrims(year, make, model) {
+  _clearTrims();
+  try {
+    const r    = await fetch(`/api/vehicles/trims?make=${encodeURIComponent(make)}&model=${encodeURIComponent(model)}&year=${year}`);
+    const data = await r.json();
+    const trims = data.trims || [];
+    trimListEl.innerHTML = trims
+      .map(t => `<option value="${escapeHtml(t)}">`)
+      .join("");
+  } catch {
+    // non-fatal — trim field stays as free text
+  }
+}
+
 // Set year/make/model selects programmatically (used by re-run from history)
-// Makes are already loaded — just set make value, then load models
+// Makes are already loaded — just set make value, then load models + trims
 async function setVehicleSelects(year, make, model) {
   yearEl.value = year || "";
+  _clearTrims();
   if (make && makeEl.querySelector(`option[value="${CSS.escape(make)}"]`)) {
     makeEl.value = make;
     if (model && year) {
       await loadModels(year, make);
       modelEl.value = model;
+      if (model) loadTrims(year, make, model);  // fire-and-forget, non-blocking
     }
   }
 }

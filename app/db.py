@@ -121,12 +121,13 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS vehicle_catalog_cache (
                 cache_type TEXT NOT NULL,
-                make TEXT,
-                year INTEGER,
-                data TEXT NOT NULL,
-                cached_at TEXT NOT NULL,
+                make       TEXT,
+                model      TEXT,
+                year       INTEGER,
+                data       TEXT NOT NULL,
+                cached_at  TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
-                PRIMARY KEY (cache_type, make, year)
+                PRIMARY KEY (cache_type, make, model, year)
             );
         """)
         _migrate(conn)
@@ -156,6 +157,25 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
         except sqlite3.OperationalError:
             pass  # column already exists
+
+    # vehicle_catalog_cache: recreate with model column in primary key if old schema
+    try:
+        conn.execute("SELECT model FROM vehicle_catalog_cache LIMIT 1")
+    except sqlite3.OperationalError:
+        # Old schema lacks model column — drop and recreate (it's a cache; loss is fine)
+        conn.execute("DROP TABLE IF EXISTS vehicle_catalog_cache")
+        conn.execute("""
+            CREATE TABLE vehicle_catalog_cache (
+                cache_type TEXT NOT NULL,
+                make       TEXT,
+                model      TEXT,
+                year       INTEGER,
+                data       TEXT NOT NULL,
+                cached_at  TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                PRIMARY KEY (cache_type, make, model, year)
+            )
+        """)
 
 
 def _seed_pull_profiles(conn: sqlite3.Connection) -> None:
@@ -486,6 +506,7 @@ def get_catalog_cache(
     *,
     cache_type: str,
     make: str | None,
+    model: str | None = None,
     year: int | None,
 ) -> list | None:
     """Return cached data list if present and not expired, else None."""
@@ -494,9 +515,9 @@ def get_catalog_cache(
     row = conn.execute(
         """
         SELECT data FROM vehicle_catalog_cache
-        WHERE cache_type = ? AND make IS ? AND year IS ? AND expires_at > ?
+        WHERE cache_type = ? AND make IS ? AND model IS ? AND year IS ? AND expires_at > ?
         """,
-        (cache_type, make, year, now),
+        (cache_type, make, model, year, now),
     ).fetchone()
     if row:
         return _json.loads(row["data"])
@@ -508,6 +529,7 @@ def set_catalog_cache(
     *,
     cache_type: str,
     make: str | None,
+    model: str | None = None,
     year: int | None,
     data: list,
     ttl_days: int = 30,
@@ -515,18 +537,19 @@ def set_catalog_cache(
     """Upsert a catalog cache entry with a TTL."""
     import json as _json
     from datetime import timedelta
-    now    = datetime.now(timezone.utc)
+    now     = datetime.now(timezone.utc)
     expires = (now + timedelta(days=ttl_days)).isoformat()
     conn.execute(
         """
-        INSERT INTO vehicle_catalog_cache (cache_type, make, year, data, cached_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(cache_type, make, year) DO UPDATE SET
-            data      = excluded.data,
-            cached_at = excluded.cached_at,
+        INSERT INTO vehicle_catalog_cache
+            (cache_type, make, model, year, data, cached_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(cache_type, make, model, year) DO UPDATE SET
+            data       = excluded.data,
+            cached_at  = excluded.cached_at,
             expires_at = excluded.expires_at
         """,
-        (cache_type, make, year, _json.dumps(data), now.isoformat(), expires),
+        (cache_type, make, model, year, _json.dumps(data), now.isoformat(), expires),
     )
 
 

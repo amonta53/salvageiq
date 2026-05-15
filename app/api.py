@@ -26,7 +26,7 @@ from app.db import (
     upsert_vehicle,
 )
 from app.salvage_service import SalvageIQRequest, run_vehicle_analysis
-from app.vehicle_catalog import fetch_makes, fetch_models
+from app.vehicle_catalog import fetch_makes, fetch_models, fetch_trims
 from app.vehicle_lookup import build_vehicle_key, normalize_vehicle_input
 
 
@@ -74,6 +74,17 @@ async def list_models(make: str, year: int) -> dict:
     """
     models = await fetch_models(make=make, year=year)
     return {"models": models}
+
+
+@app.get("/api/vehicles/trims")
+async def list_trims(make: str, model: str, year: int) -> dict:
+    """
+    Return trim/package levels for a given make + model + year.
+    Sourced from CarQuery API, cached in SQLite (30-day TTL).
+    Returns an empty list if no data is available — UI falls back to free text.
+    """
+    trims = await fetch_trims(make=make, model=model, year=year)
+    return {"trims": trims}
 
 
 # =========================================================
