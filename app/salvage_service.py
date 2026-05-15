@@ -13,7 +13,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass, Callable
+    pass
 
 import pandas as pd
 
