@@ -28,6 +28,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import httpx
 import pandas as pd
@@ -54,6 +55,25 @@ _FINDING_API_URL    = "https://svcs.ebay.com/services/search/FindingService/v1"
 _MOTORS_PARTS_CAT   = "6030"   # eBay Motors > Parts & Accessories
 _API_SERVICE_VER    = "1.13.0"
 _REQUEST_TIMEOUT    = 30        # seconds per individual request
+
+
+# =========================================================
+# URL builder
+# =========================================================
+
+def _build_url(params: dict) -> str:
+    """
+    Build a Finding API URL with parentheses kept literal in parameter names.
+
+    httpx's params= kwarg percent-encodes '(' and ')' by default, turning
+    itemFilter(0).name into itemFilter%280%29.name — which eBay rejects with
+    a 500.  Building the query string manually with safe='()' avoids this.
+    """
+    qs = "&".join(
+        f"{quote(str(k), safe='()')}={quote(str(v), safe='()')}"
+        for k, v in params.items()
+    )
+    return f"{_FINDING_API_URL}?{qs}"
 
 
 # =========================================================
@@ -113,7 +133,7 @@ async def _fetch_sold(
     rows: list[dict] = []
 
     try:
-        r = await client.get(_FINDING_API_URL, params=params)
+        r = await client.get(_build_url(params))
         r.raise_for_status()
         data = r.json()
         request_url = str(r.url)
@@ -193,7 +213,7 @@ async def _fetch_active(
     total: int  = 0
 
     try:
-        r = await client.get(_FINDING_API_URL, params=params)
+        r = await client.get(_build_url(params))
         r.raise_for_status()
         data  = r.json()
         total = int(
