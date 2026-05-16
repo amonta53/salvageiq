@@ -2,33 +2,34 @@
 # runner.py
 #
 # Purpose:
-#     eBay Finding API runner for SalvageIQ raw listing collection.
-#     Replaces the former Playwright/BeautifulSoup scraper.
+#     Data collection stage for SalvageIQ.
 #
-# Responsibilities:
-#     1. Execute all part searches via the eBay Finding API
-#     2. "sold" scope  → findCompletedItems, all 31 parts simultaneously
-#     3. "all"  scope  → findItemsAdvanced,  all 31 parts simultaneously
-#     4. Return the same raw_df / market_df schemas as the old scraper
-#        so the downstream cleanse → normalize → analyze stages are unchanged
+# "sold" scope  — findSoldListings
+#     1. Check sold_listings DB for data < 14 days old (fast path)
+#     2. If stale/missing: scrape eBay sold-search HTML via httpx + BS4
+#        (spaced by a semaphore — max 1 concurrent live scrape at a time)
+#     3. Store fresh-scraped rows in sold_listings for future lookups
 #
-# Notes:
-#     - No semaphore needed. Authenticated API calls are not subject to
-#       bot-detection, so all requests for a scope fire at the same time
-#       via asyncio.gather.
-#     - EBAY_APP_ID must be set in the environment (or .env file).
-#     - Category 6030 = eBay Motors > Parts & Accessories — keeps results
-#       automotive and avoids noise from unrelated categories.
+# "all" scope   — findActiveCount
+#     Browse API (api.ebay.com/buy/browse/v1/item_summary/search)
+#     Returns total active listing count per part.
+#     All requests fire simultaneously via asyncio.gather.
+#
+# Auth (Browse API):
+#     OAuth 2.0 Client Credentials.
+#     EBAY_APP_ID  = client_id
+#     EBAY_CERT_ID = client_secret
 # =========================================================
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
+import random
 import time
 from datetime import datetime, timezone
-from urllib.parse import quote
 
 import httpx
 import pandas as pd
@@ -37,10 +38,11 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # dotenv optional — env vars may already be set by the shell
+    pass
 
 from config.schema import MARKET_SUMMARY_COLUMNS, RAW_COLUMNS
 from config.scrape_config import ScrapeConfig
+from scrape.ebay_html import fetch_sold_html, make_session, parse_sold_html, warm_session
 from scrape.search_builder import build_execution_key, build_search_key
 from utils.io_utils import ensure_directory
 from utils.logging_utils import RunLogger, format_elapsed_hhmmss
@@ -51,60 +53,65 @@ logger = logging.getLogger(__name__)
 # Constants
 # =========================================================
 
-_FINDING_API_URL    = "https://svcs.ebay.com/services/search/FindingService/v1"
-_MOTORS_PARTS_CAT   = "6030"   # eBay Motors > Parts & Accessories
-_API_SERVICE_VER    = "1.13.0"
-_REQUEST_TIMEOUT    = 30        # seconds per individual request
+_OAUTH_URL        = "https://api.ebay.com/identity/v1/oauth2/token"
+_BROWSE_URL       = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+_MOTORS_PARTS_CAT = "6030"
+_BROWSE_TIMEOUT   = 30
+_SCOPE_BROWSE     = "https://api.ebay.com/oauth/api_scope"
+
+# One live eBay HTML scrape at a time to avoid bot detection
+_sold_sem = asyncio.Semaphore(1)
+
+# In-memory OAuth token cache: scope → (token, expiry_epoch)
+_token_cache: dict[str, tuple[str, float]] = {}
 
 
 # =========================================================
-# URL builder
+# OAuth (Browse API)
 # =========================================================
 
-def _build_url(params: dict) -> str:
-    """
-    Build a Finding API URL with parentheses kept literal in parameter names.
+def _credentials() -> tuple[str, str]:
+    app_id  = os.environ.get("EBAY_APP_ID",  "").strip()
+    cert_id = os.environ.get("EBAY_CERT_ID", "").strip()
+    if not app_id:
+        raise RuntimeError("EBAY_APP_ID is not set.")
+    if not cert_id:
+        raise RuntimeError("EBAY_CERT_ID is not set.")
+    return app_id, cert_id
 
-    httpx's params= kwarg percent-encodes '(' and ')' by default, turning
-    itemFilter(0).name into itemFilter%280%29.name — which eBay rejects with
-    a 500.  Building the query string manually with safe='()' avoids this.
-    """
-    qs = "&".join(
-        f"{quote(str(k), safe='()')}={quote(str(v), safe='()')}"
-        for k, v in params.items()
+
+async def _get_token(client: httpx.AsyncClient, scope: str) -> str:
+    now    = time.time()
+    cached = _token_cache.get(scope)
+    if cached and now < cached[1]:
+        return cached[0]
+
+    app_id, cert_id = _credentials()
+    encoded = base64.b64encode(f"{app_id}:{cert_id}".encode()).decode()
+
+    r = await client.post(
+        _OAUTH_URL,
+        headers={
+            "Authorization": f"Basic {encoded}",
+            "Content-Type":  "application/x-www-form-urlencoded",
+        },
+        data={"grant_type": "client_credentials", "scope": scope},
     )
-    return f"{_FINDING_API_URL}?{qs}"
+    r.raise_for_status()
+    body = r.json()
+
+    token      = body["access_token"]
+    expires_in = int(body.get("expires_in", 7200))
+    _token_cache[scope] = (token, now + expires_in - 60)
+    return token
 
 
 # =========================================================
-# App ID
-# =========================================================
-
-def _app_id() -> str:
-    aid = os.environ.get("EBAY_APP_ID", "").strip()
-    if not aid:
-        raise RuntimeError(
-            "EBAY_APP_ID is not set. "
-            "Add it to your .env file or environment before running."
-        )
-    return aid
-
-
-# =========================================================
-# Keyword builder
-# =========================================================
-
-def _keywords(year: int, make: str, model: str, part: str) -> str:
-    return f"{year} {make} {model} {part}"
-
-
-# =========================================================
-# Sold listings — findCompletedItems
+# Sold listings — DB-first, httpx scrape fallback
 # =========================================================
 
 async def _fetch_sold(
     client: httpx.AsyncClient,
-    app_id: str,
     year: int,
     make: str,
     model: str,
@@ -112,60 +119,69 @@ async def _fetch_sold(
     run_id: str,
 ) -> list[dict]:
     """
-    Fetch sold/completed listings for one part.
+    Return sold listing rows for one part.
 
-    Returns a list of row dicts matching RAW_COLUMNS.
+    Priority:
+        1. sold_listings DB (< 14 days) — instant, no network
+        2. Live eBay HTML scrape via httpx + BeautifulSoup
+           (serialised through _sold_sem to stay polite)
     """
-    params = {
-        "OPERATION-NAME":                 "findCompletedItems",
-        "SERVICE-VERSION":                _API_SERVICE_VER,
-        "SECURITY-APPNAME":               app_id,
-        "RESPONSE-DATA-FORMAT":           "JSON",
-        "keywords":                       _keywords(year, make, model, part),
-        "itemFilter(0).name":             "SoldItemsOnly",
-        "itemFilter(0).value":            "true",
-        "paginationInput.entriesPerPage": "100",
-        "sortOrder":                      "EndTimeSoonest",
-    }
+    from app.db import get_db, get_sold_listings, insert_sold_listings
 
-    scrape_ts = datetime.now(timezone.utc).isoformat()
-    rows: list[dict] = []
+    scrape_ts   = datetime.now(timezone.utc).isoformat()
+    vehicle_key = f"{year}|{make}|{model}"
 
-    try:
-        r = await client.get(_build_url(params))
-        r.raise_for_status()
-        data = r.json()
-        request_url = str(r.url)
-    except Exception as exc:
-        logger.warning("findCompletedItems failed | %s %s %s | %s | %s", year, make, model, part, exc)
-        return rows
+    # ── 1. DB fast path ──────────────────────────────────────
+    with get_db() as conn:
+        db_rows = get_sold_listings(conn, vehicle_key=vehicle_key, part=part, days=14)
 
-    try:
-        resp = data["findCompletedItemsResponse"][0]
-        ack  = resp.get("ack", [""])[0]
-        if ack != "Success":
-            errs = resp.get("errorMessage", [{}])[0].get("error", [{}])[0]
-            logger.warning(
-                "findCompletedItems ack=%s | %s %s %s | %s | %s — %s",
-                ack, year, make, model, part,
-                errs.get("errorId", ["?"])[0],
-                errs.get("message", ["no message"])[0],
-            )
-            return rows
-        items = resp["searchResult"][0].get("item", [])
-    except (KeyError, IndexError):
-        return rows
+    if db_rows:
+        return [
+            {
+                "run_id":       run_id,
+                "scrape_ts":    scrape_ts,
+                "pass_type":    "sold",
+                "search_year":  year,
+                "search_make":  make,
+                "search_model": model,
+                "search_part":  part,
+                "search_url":   "(db_cache)",
+                "search_page":  1,
+                "title":        row["title"],
+                "price_raw":    row["price_raw"],
+                "subtitle":     None,
+                "listing_url":  row.get("listing_url") or "",
+                "raw_text":     row["title"],
+            }
+            for row in db_rows
+        ]
 
-    for item in items:
+    # ── 2. Live scrape (serialised, Chrome TLS impersonation) ────
+    async with _sold_sem:
         try:
-            title     = item["title"][0]
-            price_val = item["sellingStatus"][0]["currentPrice"][0]["__value__"]
-            price_raw = f"${float(price_val):.2f}"
-            url       = item.get("viewItemURL", [""])[0]
-        except (KeyError, IndexError, ValueError, TypeError):
-            continue
+            async with make_session() as session:
+                await warm_session(session)
+                html, request_url = await fetch_sold_html(
+                    session, year, make, model, part
+                )
+            scraped = parse_sold_html(html, vehicle_key, year, make, model, part)
+        except Exception as exc:
+            logger.warning(
+                "eBay sold scrape failed | %s %s %s | %s | %s",
+                year, make, model, part, exc,
+            )
+            scraped = []
+            request_url = ""
 
-        rows.append({
+        if scraped:
+            with get_db() as conn:
+                insert_sold_listings(conn, scraped)
+
+        # Brief jitter even inside the semaphore to space requests
+        await asyncio.sleep(random.uniform(2.0, 4.0))
+
+    return [
+        {
             "run_id":       run_id,
             "scrape_ts":    scrape_ts,
             "pass_type":    "sold",
@@ -175,23 +191,22 @@ async def _fetch_sold(
             "search_part":  part,
             "search_url":   request_url,
             "search_page":  1,
-            "title":        title,
-            "price_raw":    price_raw,
+            "title":        row["title"],
+            "price_raw":    row["price_raw"],
             "subtitle":     None,
-            "listing_url":  url,
-            "raw_text":     title,
-        })
-
-    return rows
+            "listing_url":  row.get("listing_url") or "",
+            "raw_text":     row["title"],
+        }
+        for row in scraped
+    ]
 
 
 # =========================================================
-# Active listing count — findItemsAdvanced
+# Active listing count — Browse API
 # =========================================================
 
 async def _fetch_active(
     client: httpx.AsyncClient,
-    app_id: str,
     year: int,
     make: str,
     model: str,
@@ -199,42 +214,35 @@ async def _fetch_active(
     run_id: str,
 ) -> dict:
     """
-    Fetch active listing count for one part.
-
+    Fetch the current active listing count for one part via the Browse API.
     Returns a single row dict matching MARKET_SUMMARY_COLUMNS.
     """
-    params = {
-        "OPERATION-NAME":                 "findItemsAdvanced",
-        "SERVICE-VERSION":                _API_SERVICE_VER,
-        "SECURITY-APPNAME":               app_id,
-        "RESPONSE-DATA-FORMAT":           "JSON",
-        "keywords":                       _keywords(year, make, model, part),
-        "paginationInput.entriesPerPage": "1",   # only need the total count
-    }
-
-    scrape_ts   = datetime.now(timezone.utc).isoformat()
-    search_key  = build_search_key(year, make, model, part)
-    exec_key    = build_execution_key(year, make, model, part, "all")
-    total: int  = 0
+    scrape_ts  = datetime.now(timezone.utc).isoformat()
+    search_key = build_search_key(year, make, model, part)
+    exec_key   = build_execution_key(year, make, model, part, "all")
+    total: int = 0
 
     try:
-        r = await client.get(_build_url(params))
+        token = await _get_token(client, _SCOPE_BROWSE)
+        r = await client.get(
+            _BROWSE_URL,
+            params={
+                "q":            f"{year} {make} {model} {part}",
+                "category_ids": _MOTORS_PARTS_CAT,
+                "limit":        "1",
+            },
+            headers={
+                "Authorization":           f"Bearer {token}",
+                "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+            },
+        )
         r.raise_for_status()
-        data = r.json()
-        resp = data["findItemsAdvancedResponse"][0]
-        ack  = resp.get("ack", [""])[0]
-        if ack != "Success":
-            errs = resp.get("errorMessage", [{}])[0].get("error", [{}])[0]
-            logger.warning(
-                "findItemsAdvanced ack=%s | %s %s %s | %s | %s — %s",
-                ack, year, make, model, part,
-                errs.get("errorId", ["?"])[0],
-                errs.get("message", ["no message"])[0],
-            )
-        else:
-            total = int(resp["paginationOutput"][0]["totalEntries"][0])
+        total = int(r.json().get("total", 0))
     except Exception as exc:
-        logger.warning("findItemsAdvanced failed | %s %s %s | %s | %s", year, make, model, part, exc)
+        logger.warning(
+            "Browse API failed | %s %s %s | %s | %s",
+            year, make, model, part, exc,
+        )
 
     return {
         "run_id":               run_id,
@@ -247,7 +255,7 @@ async def _fetch_active(
         "search_make":          make,
         "search_model":         model,
         "search_part":          part,
-        "search_url":           _FINDING_API_URL,
+        "search_url":           _BROWSE_URL,
         "result_count":         total,
         "page_count_observed":  1,
     }
@@ -262,14 +270,11 @@ async def _run_api_async(
     run_logger: RunLogger,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """
-    Fire all requests for the current scope in parallel, return DataFrames.
+    Execute the data collection pass for the current scope.
 
-    "sold" scope — all 31 findCompletedItems calls simultaneously
-    "all"  scope — all 31 findItemsAdvanced  calls simultaneously
+    sold — _fetch_sold() per part (DB-first; live scrape serialised by semaphore)
+    all  — _fetch_active() per part (Browse API, all in parallel)
     """
-    aid = _app_id()
-
-    # Build (year, make, model, part) task list from config
     tasks: list[tuple[int, str, str, str]] = [
         (year, make, model, part)
         for make, models in config.make_model_map.items()
@@ -279,28 +284,29 @@ async def _run_api_async(
     ]
 
     run_logger.log(
-        f"eBay API | scope={config.search_scope} | "
-        f"{len(tasks)} requests firing in parallel"
+        f"Data collection | scope={config.search_scope} | {len(tasks)} parts"
     )
 
-    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_BROWSE_TIMEOUT) as client:
 
         if config.search_scope == "sold":
-            coros = [
-                _fetch_sold(client, aid, y, mk, mo, p, config.run_id)
+            # Gather fires all coroutines; the semaphore inside _fetch_sold
+            # ensures live scrapes are serialised while DB hits are instant.
+            coros   = [
+                _fetch_sold(client, y, mk, mo, p, config.run_id)
                 for y, mk, mo, p in tasks
             ]
             results = await asyncio.gather(*coros, return_exceptions=True)
 
             all_rows: list[dict] = []
             for i, res in enumerate(results):
+                y, mk, mo, p = tasks[i]
                 if isinstance(res, Exception):
-                    y, mk, mo, p = tasks[i]
                     run_logger.log(f"  ERROR | {y} {mk} {mo} | {p}: {res}")
                 else:
                     all_rows.extend(res)
-                    y, mk, mo, p = tasks[i]
-                    run_logger.log(f"  {y} {mk} {mo} | {p}: {len(res)} sold")
+                    src = "db" if res and res[0]["search_url"] == "(db_cache)" else "live"
+                    run_logger.log(f"  {y} {mk} {mo} | {p}: {len(res)} listings [{src}]")
 
             raw_df = (
                 pd.DataFrame(all_rows).reindex(columns=RAW_COLUMNS)
@@ -309,26 +315,25 @@ async def _run_api_async(
             )
             market_df = pd.DataFrame(columns=MARKET_SUMMARY_COLUMNS)
             stats = {
-                "total_rows": len(all_rows),
+                "total_rows":         len(all_rows),
                 "total_searches_run": len(tasks),
                 "total_pages_loaded": len(tasks),
             }
 
-        else:  # "all" scope — active counts
-            coros = [
-                _fetch_active(client, aid, y, mk, mo, p, config.run_id)
+        else:  # "all" scope — active counts, fully parallel
+            coros   = [
+                _fetch_active(client, y, mk, mo, p, config.run_id)
                 for y, mk, mo, p in tasks
             ]
             results = await asyncio.gather(*coros, return_exceptions=True)
 
             all_summaries: list[dict] = []
             for i, res in enumerate(results):
+                y, mk, mo, p = tasks[i]
                 if isinstance(res, Exception):
-                    y, mk, mo, p = tasks[i]
                     run_logger.log(f"  ERROR | {y} {mk} {mo} | {p}: {res}")
                 else:
                     all_summaries.append(res)
-                    y, mk, mo, p = tasks[i]
                     run_logger.log(
                         f"  {y} {mk} {mo} | {p}: {res['result_count']} active"
                     )
@@ -340,7 +345,7 @@ async def _run_api_async(
                 else pd.DataFrame(columns=MARKET_SUMMARY_COLUMNS)
             )
             stats = {
-                "total_rows": 0,
+                "total_rows":         0,
                 "total_searches_run": len(tasks),
                 "total_pages_loaded": len(tasks),
             }
@@ -349,20 +354,19 @@ async def _run_api_async(
 
 
 # =========================================================
-# Public entry point — sync, matches orchestrator contract
+# Public entry point
 # =========================================================
 
 def run_scrape(config: ScrapeConfig) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """
-    Run the eBay Finding API data collection stage.
+    Run the data collection stage.
 
     Sync entry point called by the pipeline orchestrator.
-    Bridges to the async implementation via asyncio.run().
 
     Returns
     -------
     tuple[pd.DataFrame, pd.DataFrame, dict]
-        raw_df:    Sold listing rows (RAW_COLUMNS schema)   — sold scope only
+        raw_df:    Sold listing rows (RAW_COLUMNS)          — sold scope only
         market_df: Active market rows (MARKET_SUMMARY_COLUMNS) — all scope only
         stats:     {"total_rows", "total_searches_run", "total_pages_loaded"}
     """
@@ -371,7 +375,7 @@ def run_scrape(config: ScrapeConfig) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     run_logger = RunLogger(config.scrape_log_path)
 
     run_logger.log("=" * 72)
-    run_logger.log("STARTING DATA COLLECTION  [eBay Finding API]")
+    run_logger.log("STARTING DATA COLLECTION")
     run_logger.log(f"Run ID:  {config.run_id}")
     run_logger.log(f"Scope:   {config.search_scope}")
     run_logger.log(f"Log:     {config.scrape_log_path}")

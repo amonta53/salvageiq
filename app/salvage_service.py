@@ -21,10 +21,12 @@ from config.config_builder import build_scrape_config
 from config.taxonomy import SEARCH_PART_TERMS
 from pipeline.orchestrator import run_pipeline
 
+from analysis.trend import compute_trend
 from app.db import (
     complete_result_set,
     create_result_set,
     get_db,
+    get_sold_listings_history,
     get_user_settings,
     insert_result_items,
     update_job,
@@ -98,10 +100,20 @@ def run_vehicle_analysis(
 
         top_df = analysis_result["top_ranked_df"]
         top_df = top_df.where(pd.notnull(top_df), None)
-        ranked_parts = [
-            enrich_item(item, settings=user_settings)
-            for item in top_df.to_dict(orient="records")
-        ]
+
+        # Attach trend data from 60-day sold listing history
+        ranked_parts = []
+        for item in top_df.to_dict(orient="records"):
+            enriched   = enrich_item(item, settings=user_settings)
+            part_name  = (enriched.get("part") or enriched.get("part_name") or "").lower().strip()
+            with get_db() as conn:
+                history = get_sold_listings_history(
+                    conn, vehicle_key=vehicle_key, part=part_name, days=60
+                )
+            trend = compute_trend(history)
+            enriched["trend_direction"] = trend["direction"]
+            enriched["trend_pct"]       = trend["pct_change"]
+            ranked_parts.append(enriched)
 
         progress("Saving results...", 90)
         with get_db() as conn:

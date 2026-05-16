@@ -556,6 +556,7 @@ function renderResults(items) {
         <td>${escapeHtml(item.sold_count)}</td>
         <td>${escapeHtml(item.active_count)}</td>
         <td>${formatPercent(str)}</td>
+        <td>${renderTrend(item.trend_direction, item.trend_pct)}</td>
         <td>${pullMins != null ? `${pullMins} min` : ""}</td>
         <td>${diff != null ? _difficultyDots(diff) : ""}</td>
         <td>${escapeHtml(conf)}</td>
@@ -579,6 +580,7 @@ function renderResults(items) {
                 <th>Sold</th>
                 <th>Active</th>
                 <th>STR</th>
+                <th>Trend</th>
                 <th>Pull Time</th>
                 <th>Difficulty</th>
                 <th>Confidence</th>
@@ -596,6 +598,17 @@ function renderResults(items) {
 // =========================================================
 // Formatters
 // =========================================================
+
+function renderTrend(direction, pct) {
+  if (!direction || direction === "new") {
+    return `<span class="trend-badge trend-new">— new</span>`;
+  }
+  const sign  = pct > 0 ? "+" : "";
+  const label = pct !== null && pct !== undefined ? `${sign}${pct}%` : "";
+  if (direction === "up")      return `<span class="trend-badge trend-up">↑ ${label}</span>`;
+  if (direction === "down")    return `<span class="trend-badge trend-down">↓ ${label}</span>`;
+  return `<span class="trend-badge trend-neutral">→ stable</span>`;
+}
 
 function _difficultyDots(score) {
   const filled = Math.round(score);

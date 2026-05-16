@@ -1,26 +1,74 @@
 # =========================================================
 # db.py
-# SQLite persistence layer for SalvageIQ
+# PostgreSQL persistence layer for SalvageIQ
 # =========================================================
 
 from __future__ import annotations
 
-import sqlite3
+import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
-DB_PATH = Path(__file__).parent.parent / "data" / "salvageiq.db"
+_TZ = ZoneInfo("America/Chicago")
+
+import psycopg2
+import psycopg2.extras
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 
-def _connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+# =========================================================
+# Connection adapter
+# =========================================================
+
+class _PGConn:
+    """
+    Thin adapter that gives psycopg2 connections the same
+    .execute() / .executemany() surface as sqlite3.Connection.
+
+    Every .execute() call opens a fresh RealDictCursor so rows are
+    returned as plain dicts.  The caller never touches raw psycopg2
+    cursors directly.
+    """
+
+    def __init__(self, raw: "psycopg2.extensions.connection") -> None:
+        self._raw = raw
+
+    def execute(self, sql: str, params: Any = ()) -> "psycopg2.extensions.cursor":
+        cur = self._raw.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql, params)
+        return cur
+
+    def executemany(self, sql: str, params_seq: Any) -> None:
+        cur = self._raw.cursor()
+        cur.executemany(sql, params_seq)
+
+    def commit(self) -> None:
+        self._raw.commit()
+
+    def rollback(self) -> None:
+        self._raw.rollback()
+
+    def close(self) -> None:
+        self._raw.close()
+
+
+def _connect() -> _PGConn:
+    url = os.environ.get(
+        "DATABASE_URL",
+        "postgresql://postgres:password@localhost:5432/salvageiq",
+    )
+    # Railway sometimes gives postgres:// — psycopg2 requires postgresql://
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    raw = psycopg2.connect(url)
+    return _PGConn(raw)
 
 
 @contextmanager
@@ -36,165 +84,191 @@ def get_db():
         conn.close()
 
 
+# =========================================================
+# Schema creation
+# =========================================================
+
+_SCHEMA_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS part_pull_profiles (
+        id                      SERIAL PRIMARY KEY,
+        part_name               TEXT NOT NULL UNIQUE,
+        estimated_pull_minutes  INTEGER NOT NULL,
+        difficulty_score        INTEGER NOT NULL,
+        tool_complexity         TEXT NOT NULL,
+        shipping_class          TEXT NOT NULL,
+        estimated_shipping_cost REAL,
+        estimated_yard_cost     REAL,
+        damage_risk_score       INTEGER,
+        storage_size            TEXT,
+        created_at              TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS vehicles (
+        id          SERIAL PRIMARY KEY,
+        vehicle_key TEXT NOT NULL UNIQUE,
+        year        INTEGER NOT NULL,
+        make        TEXT NOT NULL,
+        model       TEXT NOT NULL,
+        trim        TEXT,
+        series      TEXT,
+        engine      TEXT,
+        body_class  TEXT,
+        drive_type  TEXT,
+        fuel_type   TEXT,
+        created_at  TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS result_sets (
+        id                   SERIAL PRIMARY KEY,
+        vehicle_key          TEXT NOT NULL,
+        window_days          INTEGER NOT NULL DEFAULT 90,
+        source               TEXT NOT NULL DEFAULT 'ebay',
+        status               TEXT NOT NULL DEFAULT 'pending',
+        scraped_at           TEXT,
+        created_at           TEXT NOT NULL,
+        cache_expires_at     TEXT,
+        part_profile_version TEXT DEFAULT '1.0'
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS result_items (
+        id                     SERIAL PRIMARY KEY,
+        result_set_id          INTEGER NOT NULL,
+        part_name              TEXT NOT NULL,
+        sold_count             INTEGER,
+        active_count           INTEGER,
+        sell_through_rate      REAL,
+        median_price           REAL,
+        opportunity_score      REAL,
+        estimated_net_value    REAL,
+        recommendation         TEXT,
+        confidence_score       REAL,
+        vehicle_rank           INTEGER,
+        estimated_pull_minutes INTEGER,
+        difficulty_score       INTEGER,
+        shipping_class         TEXT,
+        trend_direction        TEXT,
+        trend_pct              REAL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS jobs (
+        id               TEXT PRIMARY KEY,
+        vehicle_key      TEXT NOT NULL,
+        status           TEXT NOT NULL DEFAULT 'queued',
+        progress_message TEXT,
+        progress_percent INTEGER DEFAULT 0,
+        result_set_id    INTEGER,
+        error_message    TEXT,
+        created_at       TEXT NOT NULL,
+        started_at       TEXT,
+        completed_at     TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS user_settings (
+        id                          INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        labor_rate_per_hour         REAL NOT NULL DEFAULT 25.0,
+        marketplace_fee_percent     REAL NOT NULL DEFAULT 0.13,
+        default_shipping_adjustment REAL NOT NULL DEFAULT 0.0,
+        risk_tolerance              TEXT NOT NULL DEFAULT 'medium'
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS vehicle_catalog_cache (
+        cache_type TEXT NOT NULL,
+        make       TEXT,
+        model      TEXT,
+        year       INTEGER,
+        data       TEXT NOT NULL,
+        cached_at  TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        PRIMARY KEY (cache_type, make, model, year)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS sold_listings (
+        id           SERIAL PRIMARY KEY,
+        vehicle_key  TEXT    NOT NULL,
+        search_year  INTEGER NOT NULL,
+        search_make  TEXT    NOT NULL,
+        search_model TEXT    NOT NULL,
+        search_part  TEXT    NOT NULL,
+        title        TEXT    NOT NULL,
+        price_raw    TEXT    NOT NULL,
+        listing_url  TEXT,
+        sold_date    TEXT,
+        scraped_at   TEXT    NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_sold_vk_part
+        ON sold_listings (vehicle_key, search_part, scraped_at DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS crawl_status (
+        vehicle_key     TEXT PRIMARY KEY,
+        last_crawled_at TEXT,
+        parts_scraped   INTEGER DEFAULT 0,
+        total_listings  INTEGER DEFAULT 0,
+        updated_at      TEXT NOT NULL
+    )
+    """,
+]
+
+
 def init_db() -> None:
     with get_db() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS part_pull_profiles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                part_name TEXT NOT NULL UNIQUE,
-                estimated_pull_minutes INTEGER NOT NULL,
-                difficulty_score INTEGER NOT NULL,
-                tool_complexity TEXT NOT NULL,
-                shipping_class TEXT NOT NULL,
-                estimated_shipping_cost REAL,
-                estimated_yard_cost REAL,
-                damage_risk_score INTEGER,
-                storage_size TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS vehicles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                vehicle_key TEXT NOT NULL UNIQUE,
-                year INTEGER NOT NULL,
-                make TEXT NOT NULL,
-                model TEXT NOT NULL,
-                trim TEXT,
-                engine TEXT,
-                body_class TEXT,
-                drive_type TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS result_sets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                vehicle_key TEXT NOT NULL,
-                window_days INTEGER NOT NULL DEFAULT 90,
-                source TEXT NOT NULL DEFAULT 'ebay',
-                status TEXT NOT NULL DEFAULT 'pending',
-                scraped_at TEXT,
-                created_at TEXT NOT NULL,
-                cache_expires_at TEXT,
-                part_profile_version TEXT DEFAULT '1.0',
-                FOREIGN KEY(vehicle_key) REFERENCES vehicles(vehicle_key)
-            );
-
-            CREATE TABLE IF NOT EXISTS result_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                result_set_id INTEGER NOT NULL,
-                part_name TEXT NOT NULL,
-                sold_count INTEGER,
-                active_count INTEGER,
-                sell_through_rate REAL,
-                median_price REAL,
-                opportunity_score REAL,
-                estimated_net_value REAL,
-                recommendation TEXT,
-                confidence_score REAL,
-                vehicle_rank INTEGER,
-                estimated_pull_minutes INTEGER,
-                difficulty_score INTEGER,
-                shipping_class TEXT,
-                FOREIGN KEY(result_set_id) REFERENCES result_sets(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS jobs (
-                id TEXT PRIMARY KEY,
-                vehicle_key TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'queued',
-                progress_message TEXT,
-                progress_percent INTEGER DEFAULT 0,
-                result_set_id INTEGER,
-                error_message TEXT,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS user_settings (
-                id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id = 1),
-                labor_rate_per_hour REAL NOT NULL DEFAULT 25.0,
-                marketplace_fee_percent REAL NOT NULL DEFAULT 0.13,
-                default_shipping_adjustment REAL NOT NULL DEFAULT 0.0,
-                risk_tolerance TEXT NOT NULL DEFAULT 'medium'
-            );
-
-            CREATE TABLE IF NOT EXISTS vehicle_catalog_cache (
-                cache_type TEXT NOT NULL,
-                make       TEXT,
-                model      TEXT,
-                year       INTEGER,
-                data       TEXT NOT NULL,
-                cached_at  TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                PRIMARY KEY (cache_type, make, model, year)
-            );
-        """)
+        for stmt in _SCHEMA_STATEMENTS:
+            conn.execute(stmt)
         _migrate(conn)
         _seed_pull_profiles(conn)
         _seed_user_settings(conn)
 
 
 # =========================================================
-# Utility
+# Migrations (additive — safe to run on every startup)
 # =========================================================
 
-def _migrate(conn: sqlite3.Connection) -> None:
+def _migrate(conn: _PGConn) -> None:
     """
-    Additive schema migrations for existing databases.
-    SQLite supports ADD COLUMN but not IF NOT EXISTS, so we catch the
-    OperationalError that fires when the column already exists.
+    ADD COLUMN IF NOT EXISTS is idempotent in PostgreSQL 9.6+,
+    so no try/except needed.
     """
     new_columns = [
         ("result_items", "estimated_pull_minutes", "INTEGER"),
         ("result_items", "difficulty_score",        "INTEGER"),
         ("result_items", "shipping_class",          "TEXT"),
+        ("result_items", "trend_direction",         "TEXT"),
+        ("result_items", "trend_pct",               "REAL"),
         ("vehicles",     "series",                  "TEXT"),
         ("vehicles",     "fuel_type",               "TEXT"),
     ]
     for table, column, col_type in new_columns:
-        try:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
-        except sqlite3.OperationalError:
-            pass  # column already exists
-
-    # vehicle_catalog_cache: recreate with model column in primary key if old schema
-    try:
-        conn.execute("SELECT model FROM vehicle_catalog_cache LIMIT 1")
-    except sqlite3.OperationalError:
-        # Old schema lacks model column — drop and recreate (it's a cache; loss is fine)
-        conn.execute("DROP TABLE IF EXISTS vehicle_catalog_cache")
-        conn.execute("""
-            CREATE TABLE vehicle_catalog_cache (
-                cache_type TEXT NOT NULL,
-                make       TEXT,
-                model      TEXT,
-                year       INTEGER,
-                data       TEXT NOT NULL,
-                cached_at  TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                PRIMARY KEY (cache_type, make, model, year)
-            )
-        """)
+        conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_type}"
+        )
 
 
-def _seed_pull_profiles(conn: sqlite3.Connection) -> None:
-    """
-    Upsert pull profiles from net_value.py into the DB.
+# =========================================================
+# Seed helpers
+# =========================================================
 
-    Uses INSERT OR IGNORE so existing rows are left untouched and
-    newly added profiles are inserted automatically on each startup.
-    """
+def _seed_pull_profiles(conn: _PGConn) -> None:
     from app.net_value import PULL_PROFILES
 
     now = datetime.now(timezone.utc).isoformat()
     conn.executemany(
         """
-        INSERT OR IGNORE INTO part_pull_profiles (
+        INSERT INTO part_pull_profiles (
             part_name, estimated_pull_minutes, difficulty_score,
             tool_complexity, shipping_class, estimated_shipping_cost,
             estimated_yard_cost, damage_risk_score, storage_size, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (part_name) DO NOTHING
         """,
         [
             (
@@ -214,22 +288,28 @@ def _seed_pull_profiles(conn: sqlite3.Connection) -> None:
     )
 
 
-def _seed_user_settings(conn: sqlite3.Connection) -> None:
-    """Insert the default settings row if it doesn't exist yet."""
+def _seed_user_settings(conn: _PGConn) -> None:
     conn.execute(
         """
-        INSERT OR IGNORE INTO user_settings (id, labor_rate_per_hour, marketplace_fee_percent,
-            default_shipping_adjustment, risk_tolerance)
+        INSERT INTO user_settings
+            (id, labor_rate_per_hour, marketplace_fee_percent,
+             default_shipping_adjustment, risk_tolerance)
         VALUES (1, 25.0, 0.13, 0.0, 'medium')
+        ON CONFLICT (id) DO NOTHING
         """
     )
 
 
+# =========================================================
+# Utility
+# =========================================================
+
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(_TZ).isoformat()
 
 
-def _row_to_dict(row: sqlite3.Row | None) -> dict | None:
+def _row_to_dict(row: Any) -> dict | None:
+    """Convert a RealDictRow (or None) to a plain dict."""
     return dict(row) if row else None
 
 
@@ -238,7 +318,7 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict | None:
 # =========================================================
 
 def upsert_vehicle(
-    conn: sqlite3.Connection,
+    conn: _PGConn,
     *,
     vehicle_key: str,
     year: int,
@@ -257,14 +337,14 @@ def upsert_vehicle(
             vehicle_key, year, make, model, trim, series,
             body_class, drive_type, engine, fuel_type, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(vehicle_key) DO UPDATE SET
-            trim       = COALESCE(excluded.trim,       vehicles.trim),
-            series     = COALESCE(excluded.series,     vehicles.series),
-            body_class = COALESCE(excluded.body_class, vehicles.body_class),
-            drive_type = COALESCE(excluded.drive_type, vehicles.drive_type),
-            engine     = COALESCE(excluded.engine,     vehicles.engine),
-            fuel_type  = COALESCE(excluded.fuel_type,  vehicles.fuel_type)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (vehicle_key) DO UPDATE SET
+            trim       = COALESCE(EXCLUDED.trim,       vehicles.trim),
+            series     = COALESCE(EXCLUDED.series,     vehicles.series),
+            body_class = COALESCE(EXCLUDED.body_class, vehicles.body_class),
+            drive_type = COALESCE(EXCLUDED.drive_type, vehicles.drive_type),
+            engine     = COALESCE(EXCLUDED.engine,     vehicles.engine),
+            fuel_type  = COALESCE(EXCLUDED.fuel_type,  vehicles.fuel_type)
         """,
         (vehicle_key, year, make, model, trim, series,
          body_class, drive_type, engine, fuel_type, _now()),
@@ -276,38 +356,39 @@ def upsert_vehicle(
 # =========================================================
 
 def create_result_set(
-    conn: sqlite3.Connection,
+    conn: _PGConn,
     *,
     vehicle_key: str,
     window_days: int = 90,
     source: str = "ebay",
 ) -> int:
-    cursor = conn.execute(
+    cur = conn.execute(
         """
         INSERT INTO result_sets (vehicle_key, window_days, source, status, created_at)
-        VALUES (?, ?, ?, 'pending', ?)
+        VALUES (%s, %s, %s, 'pending', %s)
+        RETURNING id
         """,
         (vehicle_key, window_days, source, _now()),
     )
-    return cursor.lastrowid
+    return cur.fetchone()["id"]
 
 
-def complete_result_set(conn: sqlite3.Connection, result_set_id: int, expires_days: int = 14) -> None:
+def complete_result_set(conn: _PGConn, result_set_id: int, expires_days: int = 14) -> None:
     from datetime import timedelta
-    now = datetime.now(timezone.utc)
+    now     = datetime.now(_TZ)
     expires = (now + timedelta(days=expires_days)).isoformat()
     conn.execute(
         """
         UPDATE result_sets
-        SET status = 'completed', scraped_at = ?, cache_expires_at = ?
-        WHERE id = ?
+        SET status = 'completed', scraped_at = %s, cache_expires_at = %s
+        WHERE id = %s
         """,
         (now.isoformat(), expires, result_set_id),
     )
 
 
 def get_fresh_result_set(
-    conn: sqlite3.Connection,
+    conn: _PGConn,
     vehicle_key: str,
     window_days: int = 90,
 ) -> dict | None:
@@ -315,10 +396,10 @@ def get_fresh_result_set(
     row = conn.execute(
         """
         SELECT * FROM result_sets
-        WHERE vehicle_key = ?
-          AND window_days = ?
+        WHERE vehicle_key = %s
+          AND window_days = %s
           AND status = 'completed'
-          AND cache_expires_at > ?
+          AND cache_expires_at > %s
         ORDER BY scraped_at DESC
         LIMIT 1
         """,
@@ -328,15 +409,15 @@ def get_fresh_result_set(
 
 
 def get_most_recent_result_set(
-    conn: sqlite3.Connection,
+    conn: _PGConn,
     vehicle_key: str,
     window_days: int = 90,
 ) -> dict | None:
     row = conn.execute(
         """
         SELECT * FROM result_sets
-        WHERE vehicle_key = ?
-          AND window_days = ?
+        WHERE vehicle_key = %s
+          AND window_days = %s
           AND status = 'completed'
         ORDER BY scraped_at DESC
         LIMIT 1
@@ -346,9 +427,9 @@ def get_most_recent_result_set(
     return _row_to_dict(row)
 
 
-def get_result_set_by_id(conn: sqlite3.Connection, result_set_id: int) -> dict | None:
+def get_result_set_by_id(conn: _PGConn, result_set_id: int) -> dict | None:
     row = conn.execute(
-        "SELECT * FROM result_sets WHERE id = ?", (result_set_id,)
+        "SELECT * FROM result_sets WHERE id = %s", (result_set_id,)
     ).fetchone()
     return _row_to_dict(row)
 
@@ -358,7 +439,7 @@ def get_result_set_by_id(conn: sqlite3.Connection, result_set_id: int) -> dict |
 # =========================================================
 
 def insert_result_items(
-    conn: sqlite3.Connection,
+    conn: _PGConn,
     result_set_id: int,
     items: list[dict[str, Any]],
 ) -> None:
@@ -368,8 +449,9 @@ def insert_result_items(
             result_set_id, part_name, sold_count, active_count,
             sell_through_rate, median_price, opportunity_score,
             estimated_net_value, recommendation, confidence_score, vehicle_rank,
-            estimated_pull_minutes, difficulty_score, shipping_class
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            estimated_pull_minutes, difficulty_score, shipping_class,
+            trend_direction, trend_pct
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         [
             (
@@ -387,15 +469,17 @@ def insert_result_items(
                 item.get("estimated_pull_minutes"),
                 item.get("difficulty_score"),
                 item.get("shipping_class"),
+                item.get("trend_direction"),
+                item.get("trend_pct"),
             )
             for item in items
         ],
     )
 
 
-def get_result_items(conn: sqlite3.Connection, result_set_id: int) -> list[dict]:
+def get_result_items(conn: _PGConn, result_set_id: int) -> list[dict]:
     rows = conn.execute(
-        "SELECT * FROM result_items WHERE result_set_id = ? ORDER BY vehicle_rank ASC",
+        "SELECT * FROM result_items WHERE result_set_id = %s ORDER BY vehicle_rank ASC",
         (result_set_id,),
     ).fetchall()
     return [dict(r) for r in rows]
@@ -405,18 +489,18 @@ def get_result_items(conn: sqlite3.Connection, result_set_id: int) -> list[dict]
 # Jobs
 # =========================================================
 
-def create_job(conn: sqlite3.Connection, *, job_id: str, vehicle_key: str) -> None:
+def create_job(conn: _PGConn, *, job_id: str, vehicle_key: str) -> None:
     conn.execute(
         """
         INSERT INTO jobs (id, vehicle_key, status, progress_percent, created_at)
-        VALUES (?, ?, 'queued', 0, ?)
+        VALUES (%s, %s, 'queued', 0, %s)
         """,
         (job_id, vehicle_key, _now()),
     )
 
 
 def update_job(
-    conn: sqlite3.Connection,
+    conn: _PGConn,
     job_id: str,
     *,
     status: str | None = None,
@@ -429,44 +513,44 @@ def update_job(
     values: list[Any] = []
 
     if status is not None:
-        fields.append("status = ?")
+        fields.append("status = %s")
         values.append(status)
         if status == "running":
-            fields.append("started_at = ?")
+            fields.append("started_at = %s")
             values.append(_now())
         elif status in ("completed", "failed"):
-            fields.append("completed_at = ?")
+            fields.append("completed_at = %s")
             values.append(_now())
 
     if progress_message is not None:
-        fields.append("progress_message = ?")
+        fields.append("progress_message = %s")
         values.append(progress_message)
 
     if progress_percent is not None:
-        fields.append("progress_percent = ?")
+        fields.append("progress_percent = %s")
         values.append(progress_percent)
 
     if result_set_id is not None:
-        fields.append("result_set_id = ?")
+        fields.append("result_set_id = %s")
         values.append(result_set_id)
 
     if error_message is not None:
-        fields.append("error_message = ?")
+        fields.append("error_message = %s")
         values.append(error_message)
 
     if not fields:
         return
 
     values.append(job_id)
-    conn.execute(f"UPDATE jobs SET {', '.join(fields)} WHERE id = ?", values)
+    conn.execute(f"UPDATE jobs SET {', '.join(fields)} WHERE id = %s", values)
 
 
-def get_job(conn: sqlite3.Connection, job_id: str) -> dict | None:
-    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+def get_job(conn: _PGConn, job_id: str) -> dict | None:
+    row = conn.execute("SELECT * FROM jobs WHERE id = %s", (job_id,)).fetchone()
     return _row_to_dict(row)
 
 
-def get_recent_searches(conn: sqlite3.Connection, limit: int = 15) -> list[dict]:
+def get_recent_searches(conn: _PGConn, limit: int = 15) -> list[dict]:
     """
     Return the most recent completed result set per vehicle, newest first.
     Joins vehicles so we have display-friendly year/make/model.
@@ -490,7 +574,7 @@ def get_recent_searches(conn: sqlite3.Connection, limit: int = 15) -> list[dict]
                LIMIT 1
            )
         ORDER BY rs.scraped_at DESC
-        LIMIT ?
+        LIMIT %s
         """,
         (limit,),
     ).fetchall()
@@ -502,7 +586,7 @@ def get_recent_searches(conn: sqlite3.Connection, limit: int = 15) -> list[dict]
 # =========================================================
 
 def get_catalog_cache(
-    conn: sqlite3.Connection,
+    conn: _PGConn,
     *,
     cache_type: str,
     make: str | None,
@@ -512,10 +596,15 @@ def get_catalog_cache(
     """Return cached data list if present and not expired, else None."""
     import json as _json
     now = _now()
+    # IS NOT DISTINCT FROM is the NULL-safe equality operator in PostgreSQL
     row = conn.execute(
         """
         SELECT data FROM vehicle_catalog_cache
-        WHERE cache_type = ? AND make IS ? AND model IS ? AND year IS ? AND expires_at > ?
+        WHERE cache_type = %s
+          AND make  IS NOT DISTINCT FROM %s
+          AND model IS NOT DISTINCT FROM %s
+          AND year  IS NOT DISTINCT FROM %s
+          AND expires_at > %s
         """,
         (cache_type, make, model, year, now),
     ).fetchone()
@@ -525,7 +614,7 @@ def get_catalog_cache(
 
 
 def set_catalog_cache(
-    conn: sqlite3.Connection,
+    conn: _PGConn,
     *,
     cache_type: str,
     make: str | None,
@@ -537,17 +626,17 @@ def set_catalog_cache(
     """Upsert a catalog cache entry with a TTL."""
     import json as _json
     from datetime import timedelta
-    now     = datetime.now(timezone.utc)
+    now     = datetime.now(_TZ)
     expires = (now + timedelta(days=ttl_days)).isoformat()
     conn.execute(
         """
         INSERT INTO vehicle_catalog_cache
             (cache_type, make, model, year, data, cached_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(cache_type, make, model, year) DO UPDATE SET
-            data       = excluded.data,
-            cached_at  = excluded.cached_at,
-            expires_at = excluded.expires_at
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (cache_type, make, model, year) DO UPDATE SET
+            data       = EXCLUDED.data,
+            cached_at  = EXCLUDED.cached_at,
+            expires_at = EXCLUDED.expires_at
         """,
         (cache_type, make, model, year, _json.dumps(data), now.isoformat(), expires),
     )
@@ -557,7 +646,7 @@ def set_catalog_cache(
 # User settings
 # =========================================================
 
-def get_user_settings(conn: sqlite3.Connection) -> dict:
+def get_user_settings(conn: _PGConn) -> dict:
     """Return the single user settings row, falling back to defaults."""
     row = conn.execute("SELECT * FROM user_settings WHERE id = 1").fetchone()
     if row:
@@ -571,7 +660,7 @@ def get_user_settings(conn: sqlite3.Connection) -> dict:
 
 
 def update_user_settings(
-    conn: sqlite3.Connection,
+    conn: _PGConn,
     *,
     labor_rate_per_hour: float | None = None,
     marketplace_fee_percent: float | None = None,
@@ -583,16 +672,16 @@ def update_user_settings(
     values: list[Any] = []
 
     if labor_rate_per_hour is not None:
-        fields.append("labor_rate_per_hour = ?")
+        fields.append("labor_rate_per_hour = %s")
         values.append(labor_rate_per_hour)
     if marketplace_fee_percent is not None:
-        fields.append("marketplace_fee_percent = ?")
+        fields.append("marketplace_fee_percent = %s")
         values.append(marketplace_fee_percent)
     if default_shipping_adjustment is not None:
-        fields.append("default_shipping_adjustment = ?")
+        fields.append("default_shipping_adjustment = %s")
         values.append(default_shipping_adjustment)
     if risk_tolerance is not None:
-        fields.append("risk_tolerance = ?")
+        fields.append("risk_tolerance = %s")
         values.append(risk_tolerance)
 
     if fields:
@@ -602,3 +691,169 @@ def update_user_settings(
         )
 
     return get_user_settings(conn)
+
+
+# =========================================================
+# Sold listings (crawler + runner shared store)
+# =========================================================
+
+def insert_sold_listings(conn: _PGConn, rows: list[dict]) -> None:
+    """Bulk-insert scraped sold listing rows."""
+    conn.executemany(
+        """
+        INSERT INTO sold_listings
+            (vehicle_key, search_year, search_make, search_model,
+             search_part, title, price_raw, listing_url, sold_date, scraped_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        [
+            (
+                r["vehicle_key"],
+                r["search_year"],
+                r["search_make"],
+                r["search_model"],
+                r["search_part"],
+                r["title"],
+                r["price_raw"],
+                r.get("listing_url"),
+                r.get("sold_date"),
+                r["scraped_at"],
+            )
+            for r in rows
+        ],
+    )
+
+
+def get_sold_listings(
+    conn: _PGConn,
+    vehicle_key: str,
+    part: str,
+    days: int = 14,
+) -> list[dict]:
+    """
+    Return sold listings for a vehicle+part scraped within the last *days* days.
+    Used by runner.py as a DB-first cache check.
+    """
+    rows = conn.execute(
+        """
+        SELECT * FROM sold_listings
+        WHERE vehicle_key = %s
+          AND search_part = %s
+          AND scraped_at::timestamptz >= NOW() - (%s * INTERVAL '1 day')
+        ORDER BY scraped_at DESC
+        """,
+        (vehicle_key, part, days),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_sold_listings_history(
+    conn: _PGConn,
+    vehicle_key: str,
+    part: str,
+    days: int = 60,
+) -> list[dict]:
+    """
+    Return all sold listing history for a vehicle+part over *days* days.
+    Used by trend.py to compute price direction.
+    """
+    rows = conn.execute(
+        """
+        SELECT price_raw, scraped_at, sold_date FROM sold_listings
+        WHERE vehicle_key = %s
+          AND search_part = %s
+          AND scraped_at::timestamptz >= NOW() - (%s * INTERVAL '1 day')
+        ORDER BY scraped_at DESC
+        """,
+        (vehicle_key, part, days),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# =========================================================
+# Crawl status
+# =========================================================
+
+def upsert_crawl_status(
+    conn: _PGConn,
+    *,
+    vehicle_key: str,
+    parts_scraped: int,
+    total_listings: int,
+) -> None:
+    now = _now()
+    conn.execute(
+        """
+        INSERT INTO crawl_status
+            (vehicle_key, last_crawled_at, parts_scraped, total_listings, updated_at)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (vehicle_key) DO UPDATE SET
+            last_crawled_at = EXCLUDED.last_crawled_at,
+            parts_scraped   = EXCLUDED.parts_scraped,
+            total_listings  = EXCLUDED.total_listings,
+            updated_at      = EXCLUDED.updated_at
+        """,
+        (vehicle_key, now, parts_scraped, total_listings, now),
+    )
+
+
+def get_crawl_status(conn: _PGConn, vehicle_key: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM crawl_status WHERE vehicle_key = %s", (vehicle_key,)
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+def seed_catalog_vehicles(
+    conn: _PGConn,
+    vehicles: list[dict],
+    year_start: int,
+    year_end: int,
+) -> int:
+    """
+    Insert seed vehicles into the vehicles table (ON CONFLICT DO NOTHING).
+    Covers every make/model across the given year range.
+    Returns the number of new rows inserted.
+    """
+    rows = [
+        (
+            f"{year}|{v['make']}|{v['model']}",
+            year,
+            v["make"],
+            v["model"],
+            _now(),
+        )
+        for v in vehicles
+        for year in range(year_start, year_end + 1)
+    ]
+    before = conn.execute("SELECT COUNT(*) FROM vehicles").fetchone()["count"]
+    conn.executemany(
+        """
+        INSERT INTO vehicles (vehicle_key, year, make, model, created_at)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (vehicle_key) DO NOTHING
+        """,
+        rows,
+    )
+    after = conn.execute("SELECT COUNT(*) FROM vehicles").fetchone()["count"]
+    return after - before
+
+
+def get_vehicles_for_crawl(conn: _PGConn, limit: int = 50) -> list[dict]:
+    """
+    Return vehicles that need crawling — never crawled or last crawled > 14 days ago.
+    Sorted oldest-first so the most stale vehicles are prioritized.
+    """
+    rows = conn.execute(
+        """
+        SELECT v.vehicle_key, v.year, v.make, v.model
+        FROM vehicles v
+        LEFT JOIN crawl_status cs ON cs.vehicle_key = v.vehicle_key
+        WHERE cs.last_crawled_at IS NULL
+           OR cs.last_crawled_at::timestamptz < NOW() - INTERVAL '14 days'
+        ORDER BY cs.last_crawled_at ASC NULLS FIRST
+        LIMIT %s
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]

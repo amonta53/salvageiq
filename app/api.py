@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.cache import check_cache
+from app.crawler import run_crawler
 from app.db import (
     create_job,
     get_db,
@@ -22,6 +25,7 @@ from app.db import (
     get_result_set_by_id,
     get_user_settings,
     init_db,
+    seed_catalog_vehicles,
     update_user_settings,
     upsert_vehicle,
 )
@@ -30,7 +34,40 @@ from app.vehicle_catalog import fetch_makes, fetch_models, fetch_trims
 from app.vehicle_lookup import build_vehicle_key, normalize_vehicle_input
 
 
-app = FastAPI(title="SalvageIQ", version="0.2.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialise DB, seed the vehicle catalog, and start the background crawler."""
+    from datetime import datetime
+    from config.seed_vehicles import SEED_VEHICLES
+
+    init_db()
+
+    # Seed the 25-year catalog so the crawler has vehicles to work through
+    # even before any user submits a search.
+    current_year = datetime.now().year
+    year_start   = current_year - 24   # 25 years inclusive
+    year_end     = current_year
+    with get_db() as conn:
+        new_vehicles = seed_catalog_vehicles(
+            conn, SEED_VEHICLES, year_start=year_start, year_end=year_end
+        )
+    if new_vehicles:
+        import logging
+        logging.getLogger(__name__).info(
+            "Seeded %d new catalog vehicles (%d–%d)", new_vehicles, year_start, year_end
+        )
+
+    crawler_task = asyncio.create_task(run_crawler())
+    yield
+    # Graceful shutdown — give the crawler 5 s to stop cleanly, then force it.
+    crawler_task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(crawler_task), timeout=5.0)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        pass
+
+
+app = FastAPI(title="SalvageIQ", version="0.3.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,11 +76,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def startup() -> None:
-    init_db()
 
 
 # =========================================================
@@ -287,6 +319,50 @@ def patch_settings(payload: SettingsUpdate) -> dict:
             default_shipping_adjustment=payload.default_shipping_adjustment,
             risk_tolerance=payload.risk_tolerance,
         )
+
+
+# =========================================================
+# Admin / diagnostics
+# =========================================================
+
+@app.get("/api/admin/stats")
+def admin_stats() -> dict:
+    """
+    Quick DB health check — row counts and recent crawl activity.
+    Useful for confirming the background crawler is working.
+    """
+    with get_db() as conn:
+        def count(table: str) -> int:
+            return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+        table_counts = {
+            "vehicles":      count("vehicles"),
+            "sold_listings": count("sold_listings"),
+            "crawl_status":  count("crawl_status"),
+            "result_sets":   count("result_sets"),
+            "result_items":  count("result_items"),
+            "jobs":          count("jobs"),
+        }
+
+        recent_crawls = [dict(r) for r in conn.execute("""
+            SELECT vehicle_key, last_crawled_at, parts_scraped, total_listings
+            FROM crawl_status
+            ORDER BY last_crawled_at DESC
+            LIMIT 10
+        """).fetchall()]
+
+        recent_sold = [dict(r) for r in conn.execute("""
+            SELECT vehicle_key, search_part, price_raw, sold_date, scraped_at
+            FROM sold_listings
+            ORDER BY scraped_at DESC
+            LIMIT 10
+        """).fetchall()]
+
+    return {
+        "table_counts": table_counts,
+        "recent_crawls": recent_crawls,
+        "recent_sold":   recent_sold,
+    }
 
 
 app.mount("/assets", StaticFiles(directory="assets"), name="assets")

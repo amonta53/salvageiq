@@ -3,3 +3,6 @@ httpx
 python-dotenv
 fastapi
 uvicorn
+beautifulsoup4
+curl-cffi
+psycopg2-binary
